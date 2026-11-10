@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "hcm/events/payroll.processed.schema.json",
+  "title": "payroll.processed",
+  "description": "A publicar por ms-payroll al cerrar un periodo de planilla (solo contrato; aún no implementado). Sin consumidores definidos por ahora.",
+  "type": "object",
+  "required": ["eventType", "eventId", "occurredAt", "tenantId", "periodId", "totalPaid"],
+  "properties": {
+    "eventType": { "const": "payroll.processed" },
+    "eventId": { "type": "string", "format": "uuid" },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "tenantId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+    "periodId": { "type": "string", "minLength": 1, "description": "TODO(ms-payroll): confirmar formato (p. ej. id de payroll_periods)" },
+    "totalPaid": { "type": "number", "minimum": 0, "description": "Total neto pagado del periodo. TODO(ms-payroll): acordar moneda" }
+  },
+  "additionalProperties": true
+}

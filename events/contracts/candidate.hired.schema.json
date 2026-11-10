@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "hcm/events/candidate.hired.schema.json",
+  "title": "candidate.hired",
+  "description": "Publicado por ms-recruitment (handlers/updateStage.js) cuando un candidato pasa de OFFER a HIRED. Payload REAL del handler: no incluye eventId ni occurredAt (usar el MessageId del envelope SNS para idempotencia). Es el mismo payload que candidate.stage_changed.",
+  "type": "object",
+  "required": [
+    "eventType", "tenantId", "candidateId", "vacancyId", "vacancyTitle",
+    "fullName", "email", "fromStage", "toStage", "note", "changedBy", "changedAt"
+  ],
+  "properties": {
+    "eventType": { "const": "candidate.hired" },
+    "tenantId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+    "candidateId": { "type": "string", "pattern": "^c-[0-9a-f-]{36}$" },
+    "vacancyId": { "type": "string", "pattern": "^v-[0-9a-f-]{36}$" },
+    "vacancyTitle": { "type": "string", "minLength": 1 },
+    "fullName": { "type": "string", "minLength": 3 },
+    "email": { "type": "string", "format": "email", "description": "Normalizado a minúsculas" },
+    "fromStage": { "const": "OFFER", "description": "La única transición permitida hacia HIRED es OFFER → HIRED" },
+    "toStage": { "const": "HIRED" },
+    "note": { "type": ["string", "null"], "maxLength": 500 },
+    "changedBy": { "type": "string", "description": "Email del claim del JWT o 'system'" },
+    "changedAt": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": true
+}

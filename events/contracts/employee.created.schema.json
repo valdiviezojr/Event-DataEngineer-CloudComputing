@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "hcm/events/employee.created.schema.json",
+  "title": "employee.created",
+  "description": "A publicar por ms-core-hr al crear un empleado (solo contrato; aún no implementado). Consumido por ms-payroll vía la cola payroll-hr-sync para registrar el perfil salarial.",
+  "type": "object",
+  "required": ["eventType", "eventId", "occurredAt", "tenantId", "employeeId", "email", "salary", "hireDate"],
+  "properties": {
+    "eventType": { "const": "employee.created" },
+    "eventId": { "type": "string", "format": "uuid", "description": "UUID v4 generado por el publicador; clave de idempotencia" },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "tenantId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+    "employeeId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "TODO(ms-core-hr): confirmar formato final del id" },
+    "email": { "type": "string", "format": "email" },
+    "salary": { "type": "number", "minimum": 0, "description": "Salario bruto mensual. TODO(ms-core-hr/ms-payroll): acordar moneda" },
+    "hireDate": { "type": "string", "format": "date", "description": "YYYY-MM-DD" }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "hcm/events/leave.approved.schema.json",
+  "title": "leave.approved",
+  "description": "Publicado por ms-attendance (POST /leaves/{leaveId}/approve) al aprobar una licencia. Consumido por ms-payroll vía la cola payroll-attendance-sync para descontar días no pagados.",
+  "type": "object",
+  "required": ["eventType", "eventId", "occurredAt", "tenantId", "leaveId", "employeeId", "daysUnpaid", "startDate", "endDate"],
+  "properties": {
+    "eventType": { "const": "leave.approved" },
+    "eventId": { "type": "string", "format": "uuid" },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "tenantId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+    "leaveId": { "type": "string", "pattern": "^l-[0-9a-f-]{36}$" },
+    "employeeId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+    "daysUnpaid": { "type": "integer", "minimum": 0, "description": "Días calendario a descontar (0 si la licencia es pagada)" },
+    "startDate": { "type": "string", "format": "date" },
+    "endDate": { "type": "string", "format": "date", "description": ">= startDate (inclusive)" },
+    "leaveType": { "enum": ["VACATION", "SICK", "UNPAID", "OTHER"], "description": "Opcional, informativo" },
+    "totalDays": { "type": "integer", "minimum": 1, "description": "Opcional: días calendario totales de la licencia" }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,240 @@
+service: hcm-events
+
+frameworkVersion: "3"
+
+# Stack de mensajería compartida (SNS/SQS + DLQ + tabla de idempotencia).
+# No define Lambdas: los consumidores se enganchan a las colas desde su propio servicio
+# usando los exports de abajo.
+#
+# Pre-requisito: hcm-recruitment desplegado en el mismo stage (se importa su topic
+# con Fn::ImportValue hcm-recruitment-${stage}-topic-arn). Mientras este stack exista,
+# recruitment no puede borrar ni renombrar ese export: bajar hcm-events primero.
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  iam:
+    role: ${env:LAB_ROLE_ARN}
+
+custom:
+  prefix: ${self:service}-${sls:stage}
+  dlqRetentionSeconds: 1209600 # 14 días
+  visibilityTimeout: 180       # >= 6x timeout del worker (30 s)
+  maxReceiveCount: 3
+
+resources:
+  Resources:
+    # ─────────────── Topics propios ───────────────
+    HrTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: hcm-hr-${sls:stage}-events
+
+    AttendanceTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: hcm-attendance-${sls:stage}-events
+
+    PayrollTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: hcm-payroll-${sls:stage}-events
+
+    # ─────────────── payroll-hr-sync (employee.created) ───────────────
+    PayrollHrSyncDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-payroll-hr-sync-dlq
+        MessageRetentionPeriod: ${self:custom.dlqRetentionSeconds}
+
+    PayrollHrSyncQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-payroll-hr-sync
+        VisibilityTimeout: ${self:custom.visibilityTimeout}
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt PayrollHrSyncDLQ.Arn
+          maxReceiveCount: ${self:custom.maxReceiveCount}
+
+    PayrollHrSyncQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref PayrollHrSyncQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt PayrollHrSyncQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref HrTopic
+
+    PayrollHrSyncSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref HrTopic
+        Protocol: sqs
+        Endpoint: !GetAtt PayrollHrSyncQueue.Arn
+        RawMessageDelivery: false
+        FilterPolicy:
+          eventType:
+            - employee.created
+
+    # ─────────────── payroll-attendance-sync (leave.approved) ───────────────
+    PayrollAttendanceSyncDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-payroll-attendance-sync-dlq
+        MessageRetentionPeriod: ${self:custom.dlqRetentionSeconds}
+
+    PayrollAttendanceSyncQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-payroll-attendance-sync
+        VisibilityTimeout: ${self:custom.visibilityTimeout}
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt PayrollAttendanceSyncDLQ.Arn
+          maxReceiveCount: ${self:custom.maxReceiveCount}
+
+    PayrollAttendanceSyncQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref PayrollAttendanceSyncQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt PayrollAttendanceSyncQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AttendanceTopic
+
+    PayrollAttendanceSyncSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AttendanceTopic
+        Protocol: sqs
+        Endpoint: !GetAtt PayrollAttendanceSyncQueue.Arn
+        RawMessageDelivery: false
+        FilterPolicy:
+          eventType:
+            - leave.approved
+
+    # ─────────────── hr-recruitment-sync (candidate.hired) ───────────────
+    HrRecruitmentSyncDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-hr-recruitment-sync-dlq
+        MessageRetentionPeriod: ${self:custom.dlqRetentionSeconds}
+
+    HrRecruitmentSyncQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-hr-recruitment-sync
+        VisibilityTimeout: ${self:custom.visibilityTimeout}
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt HrRecruitmentSyncDLQ.Arn
+          maxReceiveCount: ${self:custom.maxReceiveCount}
+
+    HrRecruitmentSyncQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref HrRecruitmentSyncQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt HrRecruitmentSyncQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !ImportValue hcm-recruitment-${sls:stage}-topic-arn
+
+    HrRecruitmentSyncSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !ImportValue hcm-recruitment-${sls:stage}-topic-arn
+        Protocol: sqs
+        Endpoint: !GetAtt HrRecruitmentSyncQueue.Arn
+        RawMessageDelivery: false
+        FilterPolicy:
+          eventType:
+            - candidate.hired
+
+    # ─────────────── Idempotencia de consumidores ───────────────
+    IdempotencyTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: hcm-events-idempotency-${sls:stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: eventKey
+            AttributeType: S
+        KeySchema:
+          - AttributeName: eventKey
+            KeyType: HASH
+        TimeToLiveSpecification:
+          AttributeName: expiresAt
+          Enabled: true
+
+  Outputs:
+    # Topics
+    HrTopicArn:
+      Value: !Ref HrTopic
+      Export:
+        Name: ${self:custom.prefix}-hr-topic-arn
+    AttendanceTopicArn:
+      Value: !Ref AttendanceTopic
+      Export:
+        Name: ${self:custom.prefix}-attendance-topic-arn
+    PayrollTopicArn:
+      Value: !Ref PayrollTopic
+      Export:
+        Name: ${self:custom.prefix}-payroll-topic-arn
+
+    # Colas
+    PayrollHrSyncQueueArn:
+      Value: !GetAtt PayrollHrSyncQueue.Arn
+      Export:
+        Name: ${self:custom.prefix}-payroll-hr-sync-queue-arn
+    PayrollAttendanceSyncQueueArn:
+      Value: !GetAtt PayrollAttendanceSyncQueue.Arn
+      Export:
+        Name: ${self:custom.prefix}-payroll-attendance-sync-queue-arn
+    HrRecruitmentSyncQueueArn:
+      Value: !GetAtt HrRecruitmentSyncQueue.Arn
+      Export:
+        Name: ${self:custom.prefix}-hr-recruitment-sync-queue-arn
+
+    # DLQs
+    PayrollHrSyncDLQUrl:
+      Value: !Ref PayrollHrSyncDLQ
+      Export:
+        Name: ${self:custom.prefix}-payroll-hr-sync-dlq-url
+    PayrollAttendanceSyncDLQUrl:
+      Value: !Ref PayrollAttendanceSyncDLQ
+      Export:
+        Name: ${self:custom.prefix}-payroll-attendance-sync-dlq-url
+    HrRecruitmentSyncDLQUrl:
+      Value: !Ref HrRecruitmentSyncDLQ
+      Export:
+        Name: ${self:custom.prefix}-hr-recruitment-sync-dlq-url
+
+    # Idempotencia
+    IdempotencyTableName:
+      Value: !Ref IdempotencyTable
+      Export:
+        Name: ${self:custom.prefix}-idempotency-table-name

@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "hcm/events/evaluation.completed.schema.json",
+  "title": "evaluation.completed",
+  "description": "Publicado por ms-performance (handlers/submitEvaluation.js) al registrar una evaluación 360°. Payload REAL del handler: no incluye eventId ni occurredAt.",
+  "type": "object",
+  "required": [
+    "eventType", "tenantId", "evalId", "employeeId", "employeeName", "employeeEmail",
+    "evaluatorName", "relationship", "relationshipLabel", "cycle", "score",
+    "strengths", "improvements", "anonymous", "notifyEmployee", "createdAt"
+  ],
+  "properties": {
+    "eventType": { "const": "evaluation.completed" },
+    "tenantId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+    "evalId": { "type": "string", "pattern": "^e-[0-9a-f-]{36}$" },
+    "employeeId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+    "employeeName": { "type": "string", "minLength": 2 },
+    "employeeEmail": { "type": "string", "format": "email" },
+    "evaluatorName": { "type": ["string", "null"], "description": "null cuando anonymous = true" },
+    "relationship": { "enum": ["SELF", "MANAGER", "PEER", "DIRECT_REPORT"] },
+    "relationshipLabel": { "enum": ["Autoevaluación", "Jefe directo", "Par", "Reporte directo"] },
+    "cycle": { "type": "string", "pattern": "^\\d{4}-(Q[1-4]|H[12]|ANUAL)$" },
+    "score": { "type": "number", "minimum": 1, "maximum": 5, "description": "Explícito (pasos de 0.5) o promedio de competencias redondeado a 2 decimales" },
+    "strengths": { "type": ["string", "null"], "maxLength": 1000 },
+    "improvements": { "type": ["string", "null"], "maxLength": 1000 },
+    "anonymous": { "type": "boolean", "description": "Solo puede ser true si relationship = PEER" },
+    "notifyEmployee": { "type": "boolean", "description": "false cuando relationship = SELF" },
+    "createdAt": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": true
+}

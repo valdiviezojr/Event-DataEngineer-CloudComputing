@@ -1,0 +1,149 @@
+service: hcm-attendance
+
+frameworkVersion: "3"
+
+# Requiere el stack hcm-events del mismo stage (importa el topic de asistencia).
+# Learner Lab: sin roles por función; todas las Lambdas usan LabRole.
+
+plugins:
+  - serverless-offline
+
+custom:
+  # ARN del Cognito User Pool. Vacío => endpoints sin authorizer (igual que reference/ hoy).
+  # Uso: serverless deploy --param="cognitoUserPoolArn=arn:aws:cognito-idp:us-east-1:<acct>:userpool/<id>"
+  # Serverless v3: authorizer string con ARN cognito-idp => COGNITO_USER_POOLS; string vacío => sin authorizer.
+  authorizer: ${param:cognitoUserPoolArn, ''}
+  # "true" => los workers fallan a propósito (demo de reintentos + DLQ). Uso: --param="simulateFailure=true"
+  simulateFailure: ${param:simulateFailure, 'false'}
+
+package:
+  patterns:
+    - "!tests/**"
+    - "!coverage/**"
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 15
+  logRetentionInDays: 14
+  iam:
+    role: ${env:LAB_ROLE_ARN}
+  environment:
+    ATTENDANCE_TABLE: ms-attendance-table-${sls:stage}
+    ATTENDANCE_TOPIC_ARN: !ImportValue hcm-events-${sls:stage}-attendance-topic-arn
+    TZ_OFFSET_HOURS: "-5"
+
+functions:
+  clockIn:
+    handler: handlers/clockIn.main
+    events:
+      - http:
+          path: /attendance/clock-in
+          method: post
+          cors: true
+          authorizer: ${self:custom.authorizer}
+
+  clockOut:
+    handler: handlers/clockOut.main
+    events:
+      - http:
+          path: /attendance/clock-out
+          method: post
+          cors: true
+          authorizer: ${self:custom.authorizer}
+
+  requestLeave:
+    handler: handlers/requestLeave.main
+    events:
+      - http:
+          path: /leaves/request
+          method: post
+          cors: true
+          authorizer: ${self:custom.authorizer}
+
+  approveLeave:
+    handler: handlers/approveLeave.main
+    events:
+      - http:
+          path: /leaves/{leaveId}/approve
+          method: post
+          cors: true
+          authorizer: ${self:custom.authorizer}
+
+  listAttendance:
+    handler: handlers/listAttendance.main
+    events:
+      - http:
+          path: /attendance
+          method: get
+          cors: true
+          authorizer: ${self:custom.authorizer}
+
+  # ─────────────── Workers SQS (colas de hcm-events) ───────────────
+  # Temporales: cuando ms-payroll / ms-core-hr tengan su propio consumidor, borrar la función
+  # correspondiente en el mismo despliegue (una cola = un consumidor).
+  processLeaveEventWorker:
+    handler: handlers/processLeaveEventWorker.main
+    timeout: 30
+    environment:
+      IDEMPOTENCY_TABLE: !ImportValue hcm-events-${sls:stage}-idempotency-table-name
+      SIMULATE_FAILURE: ${self:custom.simulateFailure}
+    events:
+      - sqs:
+          arn: !ImportValue hcm-events-${sls:stage}-payroll-attendance-sync-queue-arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+  processCandidateHiredWorker:
+    handler: handlers/processCandidateHiredWorker.main
+    timeout: 30
+    environment:
+      IDEMPOTENCY_TABLE: !ImportValue hcm-events-${sls:stage}-idempotency-table-name
+      SIMULATE_FAILURE: ${self:custom.simulateFailure}
+    events:
+      - sqs:
+          arn: !ImportValue hcm-events-${sls:stage}-hr-recruitment-sync-queue-arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+resources:
+  Resources:
+    AttendanceTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ATTENDANCE_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+          - AttributeName: GSI1PK
+            AttributeType: S
+          - AttributeName: GSI1SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: GSI1
+            KeySchema:
+              - AttributeName: GSI1PK
+                KeyType: HASH
+              - AttributeName: GSI1SK
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+
+  Outputs:
+    AttendanceTableName:
+      Value: !Ref AttendanceTable
+      Export:
+        Name: ${self:service}-${sls:stage}-table-name

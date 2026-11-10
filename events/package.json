@@ -1,0 +1,13 @@
+{
+  "name": "hcm-events",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "serverless deploy --config serverless-events.yml",
+    "info": "serverless info --config serverless-events.yml --verbose",
+    "remove": "serverless remove --config serverless-events.yml"
+  },
+  "devDependencies": {
+    "serverless": "^3.38.0"
+  }
+}
