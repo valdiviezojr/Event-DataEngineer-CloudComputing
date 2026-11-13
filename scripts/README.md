@@ -2,9 +2,12 @@
 
 Genera **10,000 registros por tenant** en cada microservicio (**30,000** con `tenant_a`, `tenant_b` y `tenant_c`) y los carga en RDS PostgreSQL (core_hr, payroll) y DynamoDB (recruitment, performance, attendance).
 
+Los tenants y los `employeeId` de los **usuarios demo de hcm-auth** salen de [`users.json`](users.json), así que al iniciar sesión cada usuario ve sus propios datos.
+
 ```
 seed_master.py     CLI (orquesta, verifica, imprime tablas)
-seed_config.py     Configuración (todo sobrescribible por variables de entorno)
+seed_config.py     Configuración (todo sobrescribible por variables de entorno) + carga/validación de users.json
+users.json         Usuarios demo de hcm-auth: tenantId, employeeId, email, role
 generators.py      Generadores puros de ítems/filas (sin AWS ni RDS)
 dynamo_writer.py   Escritura DynamoDB: batch + backoff, o PutItem condicional
 rds_writer.py      Escritura RDS: execute_values (lotes de 2,000) + ON CONFLICT DO NOTHING
@@ -33,6 +36,7 @@ python seed_master.py --dry-run --sample                # idem, 100 por tenant +
 python seed_master.py --service recruitment --sample    # prueba real pequeña
 python seed_master.py                                   # todo: 5 servicios × 3 tenants × 10,000
 python seed_master.py --service attendance --tenants tenant_a --per-tenant 500
+python seed_master.py --users-file otra/users.json --dry-run      # otra lista de usuarios
 python seed_master.py --verify                          # solo cuenta lo que hay (sin escribir)
 python seed_master.py --service core_hr payroll --create-schema   # RDS sin migraciones aún (DDL del diseño)
 ```
@@ -40,7 +44,8 @@ python seed_master.py --service core_hr payroll --create-schema   # RDS sin migr
 | Opción | Efecto |
 |---|---|
 | `--service {all,core_hr,payroll,recruitment,performance,attendance}…` | uno o varios (default `all`) |
-| `--tenants t1 t2…` | default `SEED_TENANTS` o los 3 tenants |
+| `--tenants t1 t2…` | default `SEED_TENANTS` o los tenants de `users.json`. Cada uno debe tener usuarios |
+| `--users-file RUTA` | archivo de usuarios (default `SEED_USERS_FILE` o `scripts/users.json`) |
 | `--per-tenant N` | registros principales por tenant (default 10,000) |
 | `--sample` | 100 por tenant |
 | `--dry-run` | no escribe ni conecta |
@@ -49,7 +54,20 @@ python seed_master.py --service core_hr payroll --create-schema   # RDS sin migr
 | `--create-schema` | RDS: `CREATE SCHEMA/TABLE IF NOT EXISTS` con el DDL del documento de diseño |
 | `--workers N` | hilos para DynamoDB (default 8) |
 
-Códigos de salida: `0` OK · `1` algún servicio falló (los demás sí se ejecutaron) · `2` `--verify` encontró menos de lo esperado.
+Códigos de salida: `0` OK · `1` algún servicio falló (los demás sí se ejecutaron) · `2` `--verify` encontró menos de lo esperado (también si un usuario demo no tiene datos) · `3` archivo de usuarios inválido (no se escribió nada).
+
+## Usuarios demo (`users.json`)
+
+```json
+[{"email": "admin@empresa-a.com", "tenantId": "tenant_a", "role": "ADMIN", "employeeId": "emp-a-admin"}, …]
+```
+
+También se acepta `{"tenants": [...], "users": [...]}` para declarar tenants explícitamente. Es la misma lista que crea `scripts/create-demo-users.js` en el repo de hcm-auth: si allí cambia un `employeeId` (hoy son **provisionales**), hay que cambiarlo aquí y volver a sembrar.
+
+- En cada tenant, los primeros k empleados son sus k usuarios, con su `employeeId` y `email` **exactos** y `status = ACTIVE`. El resto, hasta completar N, se genera como siempre (uuid5 determinístico). Los conteos no cambian.
+- Cada usuario recibe: contrato y boletas (core_hr/payroll), 100 marcaciones `CLOSED` y al menos una licencia (attendance), 2 metas sin recordatorio y 8 evaluaciones con `SUMMARY` en **2026-Q3 y 2026-Q4** (performance).
+- Antes de escribir nada se valida que el archivo exista y sea JSON; que `tenantId` y `employeeId` cumplan `^[A-Za-z0-9_-]{1,64}$` (el regex de los handlers); que no haya `employeeId` ni email repetidos en un tenant; que cada tenant pedido tenga usuarios, y que N alcance para todos (performance necesita `N ≥ usuarios × 10`). Si algo falla, el script sale con código `3` y el detalle.
+- `--verify` añade una tabla **Usuarios demo**: cada `employeeId` debe tener sus `ATTENDANCE` en attendance y sus 2 `EVAL_SUMMARY` en performance.
 
 **RDS no disponible.** Si `DB_HOST` está vacío, el host no responde, falta `psycopg2` o faltan las tablas, `core_hr` y `payroll` terminan con un mensaje claro (por ejemplo `RDS no disponible: No se pudo conectar a host:5432/hcm_db como postgres: …`). Los servicios DynamoDB se siembran igual.
 
@@ -65,7 +83,7 @@ Códigos de salida: `0` OK · `1` algún servicio falló (los demás sí se ejec
 
 ## Qué se genera
 
-Los ítems DynamoDB replican campo por campo lo que escriben los handlers de `reference/` y de `services/attendance`. `employeeId` es el mismo UUID en core_hr, payroll, performance y attendance, así que los datos cruzan entre servicios.
+Los ítems DynamoDB replican campo por campo lo que escriben los handlers de `reference/` y de `services/attendance`. `employeeId` es el mismo en core_hr, payroll, performance y attendance (el del usuario demo, o un uuid5 para el resto), así que los datos cruzan entre servicios.
 
 | Servicio | Principal (= N por tenant) | Además | Detalle |
 |---|---|---|---|
@@ -85,7 +103,7 @@ Por qué así:
   - 1 de cada 10 vacantes queda `CLOSED`.
 - **Performance**:
   - `getEmployeePerformance` arranca leyendo `SUMMARY#<emp>#`; sin SUMMARY no muestra evaluaciones. Por eso se siembran los `EVAL_SUMMARY` (`evaluationsCount`, `scoreSum`, `lastScore`) calculados a partir de las evaluaciones, igual que el `ADD` de `submitEvaluation`.
-  - Cada empleado tiene evaluaciones en el trimestre de la fecha de referencia y en el anterior (por defecto `2026-Q3` y `2026-Q4`), para que la comparación entre ciclos (`compareWith`) tenga datos. Por eso la proporción es 80% EVALUATION / 20% GOAL.
+  - Cada empleado tiene evaluaciones en `2026-Q3` y `2026-Q4` (fijos por defecto: el ciclo forma parte de la clave, así que no dependen del día en que se ejecute), para que la comparación entre ciclos (`compareWith`) tenga datos. Por eso la proporción es 80% EVALUATION / 20% GOAL.
   - Relaciones SELF, MANAGER, PEER y DIRECT_REPORT. El evaluador siempre es distinto del evaluado salvo en SELF, y `anonymous` solo se usa en PEER.
   - Puntajes en pasos de 0.5 y `score` = promedio redondeado igual que el handler.
   - **Metas con `reminder.enabled = false` y sin `GSI1PK/GSI1SK`**. Si no, el cron horario `dispatchGoalReminders` enviaría miles de correos SES. Un test con moto comprueba que el GSI `REMINDER` queda vacío.
@@ -99,6 +117,7 @@ Limitaciones conocidas:
 - Las licencias `APPROVED` sembradas **no publicaron** `leave.approved`: Nóminas no las descuenta.
 - Los correos usan dominios `example.com`. Si se cambia de etapa a un candidato sembrado, SES en sandbox rechazará el envío y el worker lo descarta.
 - Las columnas y tipos de core_hr/payroll siguen el documento de diseño y están marcados `# TODO: ajustar al esquema final` en `seed_config.py` (incluidos `CONTRACT_TYPES` y el % de descuento).
+- El DDL provisional de `--create-schema` usa `employee_id VARCHAR(64)` (no `UUID`) para aceptar IDs como `emp-a-admin`. Si las migraciones finales de Core HR usan `UUID`, core_hr y payroll fallarán con los usuarios demo.
 
 ## Configuración (variables de entorno)
 
@@ -108,11 +127,12 @@ Limitaciones conocidas:
 | `RECRUITMENT_TABLE`, `PERFORMANCE_TABLE`, `ATTENDANCE_TABLE` | `ms-<svc>-table-${STAGE}` |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SSLMODE` | —, 5432, `hcm_db`, `postgres`, —, `prefer` |
 | `SCHEMA_TENANT_A` … | nombre del tenant |
-| `SEED_TENANTS`, `SEED_PER_TENANT` | 3 tenants, 10000 |
+| `SEED_USERS_FILE` | `scripts/users.json` |
+| `SEED_TENANTS`, `SEED_PER_TENANT` | tenants de `users.json`, 10000 |
 | `SEED_REFERENCE_DATE` | hoy (solo afecta fechas, no claves) |
 | `SEED_NAMESPACE` | fijo; cambiarlo genera **otro** dataset |
 | `SEED_VACANCIES_PER_TENANT`, `SEED_ATTENDANCE_EMPLOYEES`, `SEED_PAYROLL_EMPLOYEES`, `SEED_LEAVES_RATIO` | 50, 100, 1000, 0.02 |
-| `SEED_PERF_CYCLES` | trimestre actual y anterior |
+| `SEED_PERF_CYCLES` | `2026-Q3,2026-Q4` (`,` = trimestre de la fecha de referencia y el anterior) |
 | `SEED_DYNAMO_WORKERS`, `SEED_DYNAMO_MAX_RETRIES`, `SEED_RDS_PAGE_SIZE` | 8, 8, 2000 |
 
 Los nombres de tablas y columnas RDS se cambian en `seed_config.py` (`CORE_HR`, `PAYROLL`).
@@ -124,11 +144,12 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-- `test_generators.py`: IDs según los regex de los handlers; claves iguales a las de los handlers; ninguna meta con GSI1; conteos exactos (10,000 por tenant); coherencia de `candidatesCount`, `stageHistory`, summaries, licencias y salarios; determinismo.
+- `test_generators.py`: IDs según los regex de los handlers; claves iguales a las de los handlers; ninguna meta con GSI1; conteos exactos (10,000 por tenant); coherencia de `candidatesCount`, `stageHistory`, summaries, licencias y salarios; determinismo. Usuarios demo con su `employeeId` exacto en los 4 servicios con empleados (también con `--sample`) y validación de archivos inválidos.
 - `test_seed_master.py` (moto):
   - `--dry-run` no escribe nada; `--sample` + `--verify` dan OK.
   - La segunda corrida no escribe nada y no sobrescribe ítems modificados; se reanuda tras un corte.
   - Las consultas de los handlers (GSI1 de candidatos, prefijos de performance) funcionan sobre lo sembrado y el GSI `REMINDER` queda vacío.
   - Con RDS caído o sin configurar, DynamoDB sigue funcionando.
   - Mensaje claro si falta una tabla; backoff ante `UnprocessedItems`; nunca se usa Scan.
-- `test_rds_postgres.py`: levanta un PostgreSQL temporal con `initdb`/`pg_ctl` y lo para al final. Se omite si no están instalados.
+  - `--verify` marca `FALTAN` si un usuario demo pierde sus SUMMARY; archivo de usuarios inválido, tenant sin usuarios o N insuficiente → código 3 y ninguna escritura.
+- `test_rds_postgres.py`: levanta un PostgreSQL temporal con `initdb`/`pg_ctl` y lo para al final (incluye los `employee_id` de los usuarios). Se omite si no están instalados.

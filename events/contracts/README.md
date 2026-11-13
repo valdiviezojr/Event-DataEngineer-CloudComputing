@@ -41,7 +41,7 @@ new PublishCommand({
 {
   "Type": "Notification",
   "MessageId": "6f0c2b8e-1f4a-5b3c-9d2e-7a1b2c3d4e5f",
-  "TopicArn": "arn:aws:sns:us-east-1:123456789012:hcm-attendance-dev-events",
+  "TopicArn": "arn:aws:sns:us-east-1:000000000000:hcm-attendance-dev-events",
   "Message": "{\"eventType\":\"leave.approved\",\"eventId\":\"...\",...}",
   "Timestamp": "2026-11-09T15:00:00.000Z",
   "MessageAttributes": {

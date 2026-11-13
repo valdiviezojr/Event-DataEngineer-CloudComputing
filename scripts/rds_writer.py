@@ -70,7 +70,11 @@ def count_rows(conn, schema, table):
 
 
 def create_schema(conn, schema, core_hr, payroll):
-    """DDL del documento de diseño (solo con --create-schema). TODO: reemplazar por las migraciones finales."""
+    """DDL del documento de diseño (solo con --create-schema). TODO: reemplazar por las migraciones finales.
+
+    employee_id es VARCHAR(64) y no UUID: los usuarios demo de hcm-auth usan IDs como "emp-a-admin"
+    (regex ^[A-Za-z0-9_-]{1,64}$ de los handlers). Las migraciones finales de Core HR deben aceptar ese formato.
+    """
     from psycopg2 import sql
 
     d, e, c = core_hr["departments"], core_hr["employees"], core_hr["contracts"]
@@ -84,21 +88,21 @@ def create_schema(conn, schema, core_hr, payroll):
             tbl(d), col(d, "id"), col(d, "name"), col(d, "budget")
         ),
         sql.SQL(
-            "CREATE TABLE IF NOT EXISTS {} ({} UUID PRIMARY KEY, {} UUID REFERENCES {}({}), {} VARCHAR(50) NOT NULL, "
+            "CREATE TABLE IF NOT EXISTS {} ({} VARCHAR(64) PRIMARY KEY, {} UUID REFERENCES {}({}), {} VARCHAR(50) NOT NULL, "
             "{} VARCHAR(50) NOT NULL, {} VARCHAR(100) UNIQUE NOT NULL, {} DATE NOT NULL, {} VARCHAR(20) DEFAULT 'ACTIVE')"
         ).format(
             tbl(e), col(e, "id"), col(e, "department_id"), tbl(d), col(d, "id"), col(e, "first_name"),
             col(e, "last_name"), col(e, "email"), col(e, "hire_date"), col(e, "status"),
         ),
         sql.SQL(
-            "CREATE TABLE IF NOT EXISTS {} ({} UUID PRIMARY KEY, {} UUID REFERENCES {}({}), {} NUMERIC(10,2) NOT NULL, "
+            "CREATE TABLE IF NOT EXISTS {} ({} UUID PRIMARY KEY, {} VARCHAR(64) REFERENCES {}({}), {} NUMERIC(10,2) NOT NULL, "
             "{} DATE NOT NULL, {} VARCHAR(30) NOT NULL)"
         ).format(tbl(c), col(c, "id"), col(c, "employee_id"), tbl(e), col(e, "id"), col(c, "salary"), col(c, "start_date"), col(c, "contract_type")),
         sql.SQL("CREATE TABLE IF NOT EXISTS {} ({} UUID PRIMARY KEY, {} VARCHAR(20) NOT NULL, {} BOOLEAN DEFAULT FALSE)").format(
             tbl(p), col(p, "id"), col(p, "name"), col(p, "is_closed")
         ),
         sql.SQL(
-            "CREATE TABLE IF NOT EXISTS {} ({} UUID PRIMARY KEY, {} UUID REFERENCES {}({}), {} UUID NOT NULL, "
+            "CREATE TABLE IF NOT EXISTS {} ({} UUID PRIMARY KEY, {} UUID REFERENCES {}({}), {} VARCHAR(64) NOT NULL, "
             "{} NUMERIC(10,2) NOT NULL, {} NUMERIC(10,2) DEFAULT 0.00, {} NUMERIC(10,2) NOT NULL, {} TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         ).format(
             tbl(s), col(s, "id"), col(s, "period_id"), tbl(p), col(p, "id"), col(s, "employee_id"),

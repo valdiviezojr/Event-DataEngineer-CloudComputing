@@ -1,3 +1,16 @@
+// Evento API Gateway (REST, proxy) tal como lo entrega el Lambda Authorizer TOKEN de hcm-auth:
+// context plano en requestContext.authorizer (tenantId, role, employeeId, userId, email).
+// tenant: null => sin context del authorizer (offline o petición sin token).
+const apiEvent = ({ tenant = "tenant_a", role = "HR", employeeId = "emp-a-hr", email = "hr@empresa-a.com", headers = {}, body, qs, path, authorizer } = {}) => ({
+  headers,
+  body: body === undefined ? undefined : JSON.stringify(body),
+  queryStringParameters: qs || null,
+  pathParameters: path || null,
+  requestContext: {
+    authorizer: authorizer !== undefined ? authorizer : tenant ? { principalId: `user-${employeeId}`, tenantId: tenant, role, employeeId, userId: `user-${employeeId}`, email } : {},
+  },
+});
+
 // Fábricas de records SQS para los tests de workers.
 const leaveApproved = (over = {}) => ({
   eventType: "leave.approved",
@@ -47,4 +60,4 @@ const snsRecord = (message, { messageId = "sqs-1", snsMessageId = "sns-msg-1", t
   }),
 });
 
-module.exports = { leaveApproved, candidateHired, snsRecord };
+module.exports = { apiEvent, leaveApproved, candidateHired, snsRecord };

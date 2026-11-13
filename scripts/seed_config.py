@@ -1,5 +1,7 @@
 """Configuración del seeding. Todo se puede sobrescribir con variables de entorno."""
+import json
 import os
+import re
 import uuid
 from datetime import date
 
@@ -20,7 +22,11 @@ def _list(name, default):
 STAGE = _env("STAGE", "dev")
 AWS_REGION = _env("AWS_REGION", "us-east-1")
 
-TENANTS = _list("SEED_TENANTS", ["tenant_a", "tenant_b", "tenant_c"])
+# Usuarios demo del stack hcm-auth (tenantId + employeeId + email). Sus tenants son los que se siembran y sus
+# employeeId se usan tal cual en core_hr, payroll, performance y attendance. Ver load_users().
+USERS_FILE = _env("SEED_USERS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json"))
+# Vacío => los tenants del archivo de usuarios. Si se fija, cada tenant debe tener usuarios en el archivo.
+TENANTS = _list("SEED_TENANTS", [])
 PER_TENANT = _int("SEED_PER_TENANT", 10_000)
 SAMPLE_PER_TENANT = 100
 
@@ -53,7 +59,9 @@ CANDIDATE_STAGE_WEIGHTS = {"APPLIED": 40, "INTERVIEW": 25, "OFFER": 10, "HIRED":
 # Con los defaults: 2 + 2*4 = 10 ítems/empleado → 1,000 empleados evaluados por tenant (80% EVALUATION, 20% GOAL).
 PERF_GOALS_PER_EMPLOYEE = _int("SEED_PERF_GOALS_PER_EMPLOYEE", 2)
 PERF_RELATIONSHIPS = ["SELF", "MANAGER", "PEER", "DIRECT_REPORT"]
-PERF_CYCLES = _list("SEED_PERF_CYCLES", [])  # vacío => trimestre de REFERENCE_DATE y el anterior
+# Ciclos fijos (forman parte de las claves EVAL#/SUMMARY#): reejecutar otro día no crea ciclos nuevos.
+# Vacío (SEED_PERF_CYCLES=",") => trimestre de REFERENCE_DATE y el anterior.
+PERF_CYCLES = _list("SEED_PERF_CYCLES", ["2026-Q3", "2026-Q4"])
 PERF_GOAL_STATUS_WEIGHTS = {"ACTIVE": 60, "COMPLETED": 30, "CANCELLED": 10}
 
 # Attendance: N marcaciones repartidas en ATTENDANCE_EMPLOYEES empleados × días hábiles hacia atrás.
@@ -72,8 +80,9 @@ RDS = {
 }
 RDS_PAGE_SIZE = _int("SEED_RDS_PAGE_SIZE", 2000)
 
-# Schema por tenant (patrón Single Database, Multiple Schemas). Por defecto schema = tenant.
-SCHEMAS = {t: _env(f"SCHEMA_{t.upper()}", t) for t in TENANTS}
+# Schema por tenant (patrón Single Database, Multiple Schemas). Por defecto schema = tenant (SCHEMA_TENANT_A=…).
+def schema_for(tenant):
+    return _env(f"SCHEMA_{tenant.upper()}", tenant)
 
 # TODO: ajustar al esquema final de ms-core-hr (documento de diseño, sección Core HR).
 # Claves = nombre lógico usado por el script; valores = nombre real en la BD.
@@ -122,3 +131,73 @@ PAYROLL_DEDUCTION_RATE = float(_env("SEED_PAYROLL_DEDUCTION_RATE", "0.13"))  # T
 SERVICES = ["core_hr", "payroll", "recruitment", "performance", "attendance"]
 RDS_SERVICES = ["core_hr", "payroll"]
 DYNAMO_SERVICES = ["recruitment", "performance", "attendance"]
+
+
+# ───────────── Usuarios demo (hcm-auth) ─────────────
+# Mismo regex que EMPLOYEE_RE (lib/http.js) y TENANT_RE (dynamoTenantFilter.js).
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class UsersFileError(Exception):
+    """Archivo de usuarios ausente o inválido. El mensaje es para el usuario."""
+
+
+def load_users(path=None, tenants=None):
+    """Lee y valida el archivo de usuarios. Devuelve {tenantId: [usuario, ...]} en el orden del archivo.
+
+    Formatos aceptados: una lista de usuarios ({"tenantId", "employeeId", "email"?, "role"?}) o
+    {"tenants": [...], "users": [...]}. `tenants` (o la clave "tenants") son los tenants a sembrar: cada uno
+    debe tener al menos un usuario. No escribe nada; se llama antes de cualquier escritura.
+    """
+    path = path or USERS_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raise UsersFileError(f"no existe el archivo de usuarios {path} (configura SEED_USERS_FILE o --users-file)")
+    except (OSError, ValueError) as e:
+        raise UsersFileError(f"no se pudo leer {path} como JSON: {e}")
+
+    declared = None
+    if isinstance(raw, dict):
+        declared, raw = raw.get("tenants"), raw.get("users")
+        if declared is not None and (not isinstance(declared, list) or not all(isinstance(t, str) for t in declared)):
+            raise UsersFileError(f"{path}: \"tenants\" debe ser una lista de strings")
+    if not isinstance(raw, list) or not raw:
+        raise UsersFileError(f"{path}: se esperaba una lista no vacía de usuarios (o {{\"users\": [...]}})")
+
+    by_tenant, errors = {}, []
+    for i, u in enumerate(raw):
+        where = f"usuario #{i + 1}"
+        if not isinstance(u, dict):
+            errors.append(f"{where}: debe ser un objeto")
+            continue
+        t, e = u.get("tenantId"), u.get("employeeId")
+        where += f" ({u.get('email') or e})"
+        if not isinstance(t, str) or not ID_RE.match(t):
+            errors.append(f"{where}: tenantId {t!r} no cumple ^[A-Za-z0-9_-]{{1,64}}$")
+            continue
+        if not isinstance(e, str) or not ID_RE.match(e):
+            errors.append(f"{where}: employeeId {e!r} no cumple ^[A-Za-z0-9_-]{{1,64}}$")
+            continue
+        email = u.get("email")
+        if email is not None and (not isinstance(email, str) or "@" not in email):
+            errors.append(f"{where}: email {email!r} inválido")
+            continue
+        users = by_tenant.setdefault(t, [])
+        if any(x["employeeId"] == e for x in users):
+            errors.append(f"{where}: employeeId {e} repetido en {t}")
+        elif email and any((x.get("email") or "").lower() == email.lower() for x in users):
+            errors.append(f"{where}: email {email} repetido en {t}")
+        else:
+            users.append({"tenantId": t, "employeeId": e, "email": email.lower() if email else None, "role": u.get("role")})
+
+    wanted = list(tenants or declared or by_tenant)
+    for t in wanted:
+        if not ID_RE.match(t):
+            errors.append(f"tenant {t!r} no cumple ^[A-Za-z0-9_-]{{1,64}}$")
+        elif t not in by_tenant:
+            errors.append(f"el tenant {t} no tiene usuarios en {path}")
+    if errors:
+        raise UsersFileError(f"{path} inválido:\n  - " + "\n  - ".join(errors))
+    return {t: by_tenant[t] for t in wanted}

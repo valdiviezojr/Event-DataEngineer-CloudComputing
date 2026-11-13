@@ -12,13 +12,7 @@ const approveLeave = require("../handlers/approveLeave").main;
 const ctx = { awsRequestId: "req-test-1" };
 const LEAVE_ID = "l-11111111-2222-4333-8444-555555555555";
 
-const evt = ({ tenant = "tenant_a", headers = {}, body, qs, path } = {}) => ({
-  headers,
-  body: body === undefined ? undefined : JSON.stringify(body),
-  queryStringParameters: qs || null,
-  pathParameters: path || null,
-  requestContext: { authorizer: tenant ? { claims: { "custom:tenant_id": tenant, email: "rrhh@empresa.com" } } : {} },
-});
+const { apiEvent: evt } = require("./helpers");
 
 let ddbSend;
 let snsSend;
@@ -66,10 +60,26 @@ describe("rechazo de tenant distinto al del token (403)", () => {
   });
 });
 
-describe("resolución del tenant", () => {
-  test("sin claim y fuera de offline => 401 aunque venga x-tenant-id", async () => {
+describe("resolución del tenant (Lambda authorizer de hcm-auth)", () => {
+  test("lee tenantId del context plano del authorizer", async () => {
+    const out = await clockIn(evt({ tenant: "tenant_c", body: { employeeId: "emp-c-admin" } }), ctx);
+    expect(out.statusCode).toBe(201);
+    const put = ddbSend.mock.calls[0][0].input;
+    expect(put.Item.PK).toBe("TENANT#tenant_c");
+    expect(put.Item.recordedBy).toBe("hr@empresa-a.com"); // email del authorizer
+  });
+
+  test("sin tenantId en el authorizer y fuera de offline => 401 aunque venga x-tenant-id", async () => {
     const out = await clockIn(evt({ tenant: null, headers: { "x-tenant-id": "tenant_a" }, body: { employeeId: "emp-1" } }), ctx);
     expect(out.statusCode).toBe(401);
+    expect(ddbSend).not.toHaveBeenCalled();
+  });
+
+  test("la ruta antigua (claims custom:tenant_id) ya no se acepta => 401", async () => {
+    for (const authorizer of [{ claims: { "custom:tenant_id": "tenant_a" } }, { jwt: { claims: { "custom:tenant_id": "tenant_a" } } }]) {
+      const out = await clockIn(evt({ authorizer, body: { employeeId: "emp-1" } }), ctx);
+      expect(out.statusCode).toBe(401);
+    }
     expect(ddbSend).not.toHaveBeenCalled();
   });
 
@@ -82,13 +92,50 @@ describe("resolución del tenant", () => {
     expect(put.Item.tenantId).toBe("tenant_b");
   });
 
-  test("mismo tenant en header y claim => permitido; el PK sale del claim", async () => {
+  test("IS_OFFLINE con authorizer: manda el authorizer y un x-tenant-id distinto => 403", async () => {
+    process.env.IS_OFFLINE = "true";
+    expect403(await clockIn(evt({ tenant: "tenant_b", headers: { "x-tenant-id": "tenant_a" }, body: { employeeId: "emp-1" } }), ctx));
+  });
+
+  test("mismo tenant en header y authorizer => permitido; el PK sale del authorizer", async () => {
     const out = await clockIn(evt({ headers: { "x-tenant-id": "tenant_a" }, body: { employeeId: "emp-1", tenantId: "tenant_a" } }), ctx);
     expect(out.statusCode).toBe(201);
     const put = ddbSend.mock.calls[0][0].input;
     expect(put.Item.PK).toBe("TENANT#tenant_a");
     expect(put.Item.SK).toMatch(/^ATTENDANCE#emp-1#\d{4}-\d{2}-\d{2}$/);
     expect(put.ConditionExpression).toBe("attribute_not_exists(SK)");
+  });
+});
+
+describe("rol y employeeId del authorizer", () => {
+  const employee = { role: "EMPLOYEE", employeeId: "emp-a-001", email: "empleado@empresa-a.com" };
+
+  test("EMPLOYEE opera sobre su propio employeeId", async () => {
+    const out = await clockIn(evt({ ...employee, body: { employeeId: "emp-a-001" } }), ctx);
+    expect(out.statusCode).toBe(201);
+  });
+
+  test("EMPLOYEE sobre otro employeeId => 403 sin tocar DynamoDB", async () => {
+    for (const out of [
+      await clockIn(evt({ ...employee, body: { employeeId: "emp-a-hr" } }), ctx),
+      await listAttendance(evt({ ...employee, qs: { employeeId: "emp-a-hr" } }), ctx),
+      await requestLeave(evt({ ...employee, body: { employeeId: "emp-a-hr", type: "VACATION", startDate: "2099-01-04", endDate: "2099-01-05" } }), ctx),
+    ]) {
+      expect(out.statusCode).toBe(403);
+      expect(JSON.parse(out.body).message).toBe("Solo puedes operar sobre tus propios registros");
+    }
+    expect(ddbSend).not.toHaveBeenCalled();
+  });
+
+  test("EMPLOYEE no puede aprobar licencias; HR y ADMIN sí llegan a DynamoDB", async () => {
+    const denied = await approveLeave(evt({ ...employee, path: { leaveId: LEAVE_ID } }), ctx);
+    expect(denied.statusCode).toBe(403);
+    expect(ddbSend).not.toHaveBeenCalled();
+
+    for (const role of ["HR", "ADMIN"]) {
+      const out = await approveLeave(evt({ role, path: { leaveId: LEAVE_ID } }), ctx);
+      expect(out.statusCode).toBe(404); // get vacío (mock) => licencia no encontrada
+    }
   });
 });
 

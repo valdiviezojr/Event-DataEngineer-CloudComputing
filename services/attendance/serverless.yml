@@ -2,17 +2,22 @@ service: hcm-attendance
 
 frameworkVersion: "3"
 
-# Requiere el stack hcm-events del mismo stage (importa el topic de asistencia).
+# Requiere los stacks hcm-auth (authorizer) y hcm-events (topic y colas) del mismo stage.
 # Learner Lab: sin roles por función; todas las Lambdas usan LabRole.
 
 plugins:
   - serverless-offline
 
 custom:
-  # ARN del Cognito User Pool. Vacío => endpoints sin authorizer (igual que reference/ hoy).
-  # Uso: serverless deploy --param="cognitoUserPoolArn=arn:aws:cognito-idp:us-east-1:<acct>:userpool/<id>"
-  # Serverless v3: authorizer string con ARN cognito-idp => COGNITO_USER_POOLS; string vacío => sin authorizer.
-  authorizer: ${param:cognitoUserPoolArn, ''}
+  # Lambda Authorizer TOKEN del stack hcm-auth-${stage} (integrante de infraestructura). Este stack NO crea
+  # otra Lambda authorizer: solo la referencia. Se lee con ${cf:} (output AuthorizerArn del stack) y no con
+  # !ImportValue, porque Serverless v3 necesita authorizer.arn como string (con ImportValue falla).
+  # El param authorizerArn solo existe para `serverless print/package/offline` sin AWS; en deploy no se pasa.
+  authorizerArn: ${param:authorizerArn, cf:hcm-auth-${sls:stage}.AuthorizerArn}
+  authorizer:
+    arn: ${self:custom.authorizerArn}
+    type: token
+    resultTtlInSeconds: 0
   # "true" => los workers fallan a propósito (demo de reintentos + DLQ). Uso: --param="simulateFailure=true"
   simulateFailure: ${param:simulateFailure, 'false'}
 

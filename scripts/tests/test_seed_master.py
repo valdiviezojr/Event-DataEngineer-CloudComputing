@@ -75,7 +75,7 @@ def test_sample_siembra_verifica_y_es_idempotente(ddb, capsys):
     assert seed_master.main(["--sample", "--service", *DYNAMO], dynamo_client=client, rds_connect=no_rds) == 0
 
     # 100 principales por tenant + derivados (vacantes, guards, summaries, licencias)
-    exp = {s: sum(sum(G.count_by_entity(s, G.generate(s, t, 100)).values()) for t in C.TENANTS) for s in DYNAMO}
+    exp = {s: sum(sum(G.count_by_entity(s, G.generate(s, t, 100)).values()) for t in C.load_users()) for s in DYNAMO}
     for s in DYNAMO:
         assert table_count(ddb, C.DYNAMO_TABLES[s]) == exp[s]
 
@@ -86,6 +86,11 @@ def test_sample_siembra_verifica_y_es_idempotente(ddb, capsys):
     assert "recruitment  tenant_b  CANDIDATE     100       100         OK" in out
     assert "performance  tenant_a  GOAL" in out and "performance  tenant_a  EVALUATION" in out
     assert "query" in client.calls
+    # Cada usuario demo existe en attendance (ATTENDANCE) y performance (EVAL_SUMMARY)
+    for t, users in C.load_users().items():
+        for u in users:
+            assert f"attendance   {t}  {u['employeeId']}" in out and f"performance  {t}  {u['employeeId']}" in out
+    assert out.count(" OK") >= 2 * 3 * 3 + 2 * 7
 
     # Segunda corrida: nada nuevo
     assert seed_master.main(["--sample", "--service", *DYNAMO], dynamo_client=client, rds_connect=no_rds) == 0
@@ -127,6 +132,7 @@ def test_datos_sembrados_funcionan_con_las_consultas_de_los_handlers(ddb):
     assert out["Count"] == vac["candidatesCount"] > 0
 
     emp = G.employee("tenant_a", 0)["employeeId"]
+    assert emp == "emp-a-admin"  # primer usuario de users.json
     q = lambda prefix: ddb.query(  # noqa: E731
         TableName=C.DYNAMO_TABLES["performance"], KeyConditionExpression="PK = :pk AND begins_with(SK, :p)",
         ExpressionAttributeValues={":pk": {"S": "TENANT#tenant_a"}, ":p": {"S": prefix}},
@@ -201,3 +207,49 @@ def test_backoff_ante_UnprocessedItems():
 def test_backoff_se_rinde_con_mensaje():
     with pytest.raises(DynamoSeedError, match="se agotaron 2 reintentos"):
         DynamoWriter(FlakyClient(fails=99), "t", workers=1, max_retries=2, sleep=lambda s: None).write(G.generate("attendance", "tenant_a", 5))
+
+
+# ───────────── usuarios demo ─────────────
+
+
+def test_verify_detecta_usuario_sin_datos(ddb, capsys):
+    args = ["--sample", "--service", "performance", "--tenants", "tenant_a"]
+    assert seed_master.main(args, dynamo_client=ddb, rds_connect=no_rds) == 0
+    table = C.DYNAMO_TABLES["performance"]
+    for cycle in ("2026-Q3", "2026-Q4"):
+        ddb.delete_item(TableName=table, Key={"PK": {"S": "TENANT#tenant_a"}, "SK": {"S": f"SUMMARY#emp-a-001#{cycle}"}})
+    capsys.readouterr()
+    assert seed_master.main(args + ["--verify"], dynamo_client=ddb, rds_connect=no_rds) == 2
+    out = capsys.readouterr().out
+    assert "performance  tenant_a  emp-a-001    EVAL_SUMMARY  2         0           FALTAN" in out
+    assert "performance  tenant_a  emp-a-admin  EVAL_SUMMARY  2         2           OK" in out
+
+
+@pytest.mark.parametrize(
+    "content, msg",
+    [
+        ('[{"tenantId":"tenant_a","employeeId":"emp a"}]', "employeeId 'emp a' no cumple"),
+        ('{"tenants":["tenant_a","tenant_b"],"users":[{"tenantId":"tenant_a","employeeId":"e1"}]}', "el tenant tenant_b no tiene usuarios"),
+        ("no-json", "no se pudo leer"),
+    ],
+)
+def test_archivo_de_usuarios_invalido_no_escribe_nada(ddb, capsys, tmp_path, monkeypatch, content, msg):
+    path = tmp_path / "users.json"
+    path.write_text(content)
+    monkeypatch.setenv("SEED_USERS_FILE", str(path))  # documentado; aquí se pasa por CLI
+    rc = seed_master.main(["--sample", "--users-file", str(path)], dynamo_client=NoScan(ddb), rds_connect=no_rds)
+    err = capsys.readouterr().err
+    assert rc == 3 and msg in err and "No se escribió nada" in err
+    assert all(table_count(ddb, t) == 0 for t in C.DYNAMO_TABLES.values())
+
+
+def test_tenant_pedido_sin_usuarios_no_escribe_nada(ddb, capsys):
+    rc = seed_master.main(["--sample", "--tenants", "tenant_a", "tenant_z"], dynamo_client=ddb, rds_connect=no_rds)
+    assert rc == 3 and "el tenant tenant_z no tiene usuarios" in capsys.readouterr().err
+    assert all(table_count(ddb, t) == 0 for t in C.DYNAMO_TABLES.values())
+
+
+def test_per_tenant_insuficiente_para_los_usuarios(ddb, capsys):
+    rc = seed_master.main(["--per-tenant", "20", "--service", "performance"], dynamo_client=ddb, rds_connect=no_rds)
+    assert rc == 3 and "usa al menos --per-tenant 30" in capsys.readouterr().err
+    assert table_count(ddb, C.DYNAMO_TABLES["performance"]) == 0

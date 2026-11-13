@@ -39,8 +39,10 @@ def rds_env(pg, monkeypatch):
     monkeypatch.setitem(C.RDS, "sslmode", "disable")
 
 
-def test_sin_tablas_mensaje_claro(rds_env, capsys):
-    rc = seed_master.main(["--sample", "--service", "core_hr", "--tenants", "tenant_z"])
+def test_sin_tablas_mensaje_claro(rds_env, capsys, tmp_path):
+    users = tmp_path / "users.json"
+    users.write_text('[{"tenantId": "tenant_z", "employeeId": "emp-z-1"}]')
+    rc = seed_master.main(["--sample", "--service", "core_hr", "--tenants", "tenant_z", "--users-file", str(users)])
     assert rc == 1
     assert "faltan tablas en el schema 'tenant_z'" in capsys.readouterr().err
 
@@ -61,3 +63,19 @@ def test_seed_rds_idempotente_y_verify(rds_env, capsys):
     assert "core_hr tenant_b employees 100 100 OK" in out
     assert "payroll tenant_a pay_slips 100 100 OK" in out
     assert "FALTAN" not in out
+
+
+def test_usuarios_demo_en_rds(rds_env):
+    """employee_id de los usuarios (no UUID) entra en employees, contracts y pay_slips (DDL VARCHAR(64))."""
+    import psycopg2
+
+    assert seed_master.main(["--sample", "--service", "core_hr", "payroll", "--create-schema"]) == 0
+    conn = psycopg2.connect(host="127.0.0.1", port=PORT, user="postgres", dbname="hcm_db", sslmode="disable")
+    with conn.cursor() as cur:
+        for t, users in C.load_users().items():
+            for u in users:
+                cur.execute(f"SELECT email, status FROM {t}.employees WHERE employee_id = %s", (u["employeeId"],))
+                assert cur.fetchone() == (u["email"], "ACTIVE")
+                cur.execute(f"SELECT count(*) FROM {t}.pay_slips WHERE employee_id = %s", (u["employeeId"],))
+                assert cur.fetchone()[0] > 0
+    conn.close()

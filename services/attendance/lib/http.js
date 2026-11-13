@@ -23,15 +23,16 @@ const res = (statusCode, body) => ({
   body: JSON.stringify(body),
 });
 
-const getClaims = (event) => {
-  const auth = event.requestContext?.authorizer || {};
-  return auth.claims || auth.jwt?.claims || {};
-};
+// Único punto que conoce dónde deja la identidad el authorizer. El Lambda Authorizer TOKEN de hcm-auth
+// devuelve un context plano: event.requestContext.authorizer.{tenantId, role, employeeId, userId, email}
+// (sin "custom:" ni claims/jwt.claims). Si el authorizer cambia, se ajusta solo aquí.
+const getAuthContext = (event) => event.requestContext?.authorizer || {};
 
 const getTenantId = (event) => {
-  const fromToken = getClaims(event)["custom:tenant_id"];
+  const fromToken = getAuthContext(event).tenantId;
   if (fromToken) return fromToken;
 
+  // serverless offline no ejecuta authorizers por ARN: ahí el tenant viene en x-tenant-id.
   if (process.env.IS_OFFLINE) {
     const h = event.headers || {};
     return h["x-tenant-id"] || h["X-Tenant-Id"];
@@ -39,7 +40,7 @@ const getTenantId = (event) => {
   return null;
 };
 
-const getActor = (event) => getClaims(event).email || "system";
+const getActor = (event) => getAuthContext(event).email || "system";
 
 class HttpError extends Error {
   constructor(statusCode, message, extra = {}) {
@@ -61,14 +62,13 @@ const parseBody = (event) => {
   return body;
 };
 
-// Rol EMPLOYEE (claim custom:role) solo puede operar sobre su propio employeeId, como en performance/.
+const isEmployeeRole = (event) => String(getAuthContext(event).role || "").toUpperCase() === "EMPLOYEE";
+
+// Rol EMPLOYEE solo puede operar sobre su propio employeeId (del authorizer), como en performance/.
 const assertEmployeeScope = (event, employeeId) => {
-  const claims = getClaims(event);
-  if (String(claims["custom:role"] || "").toUpperCase() === "EMPLOYEE" && claims["custom:employee_id"] !== employeeId)
+  if (isEmployeeRole(event) && getAuthContext(event).employeeId !== employeeId)
     throw new HttpError(403, "Solo puedes operar sobre tus propios registros");
 };
-
-const isEmployeeRole = (event) => String(getClaims(event)["custom:role"] || "").toUpperCase() === "EMPLOYEE";
 
 const strip = (item) => {
   if (!item) return item;
@@ -152,7 +152,7 @@ module.exports = {
   RETRYABLE,
   HttpError,
   res,
-  getClaims,
+  getAuthContext,
   getTenantId,
   getActor,
   parseBody,

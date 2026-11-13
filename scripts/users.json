@@ -1,0 +1,9 @@
+[
+  {"email": "admin@empresa-a.com", "tenantId": "tenant_a", "role": "ADMIN", "employeeId": "emp-a-admin"},
+  {"email": "hr@empresa-a.com", "tenantId": "tenant_a", "role": "HR", "employeeId": "emp-a-hr"},
+  {"email": "empleado@empresa-a.com", "tenantId": "tenant_a", "role": "EMPLOYEE", "employeeId": "emp-a-001"},
+  {"email": "admin@empresa-b.com", "tenantId": "tenant_b", "role": "ADMIN", "employeeId": "emp-b-admin"},
+  {"email": "hr@empresa-b.com", "tenantId": "tenant_b", "role": "HR", "employeeId": "emp-b-hr"},
+  {"email": "empleado@empresa-b.com", "tenantId": "tenant_b", "role": "EMPLOYEE", "employeeId": "emp-b-001"},
+  {"email": "admin@empresa-c.com", "tenantId": "tenant_c", "role": "ADMIN", "employeeId": "emp-c-admin"}
+]

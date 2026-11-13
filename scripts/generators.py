@@ -7,6 +7,10 @@ Los ítems DynamoDB replican EXACTAMENTE lo que escriben los handlers:
 
 Todo es determinístico por (tenant, índice): las claves salen de uuid5 y los valores de un
 random.Random sembrado con el mismo par, así que re-ejecutar produce los mismos ítems.
+
+Usuarios demo (use_users): los primeros k empleados de cada tenant son los k usuarios del archivo, con su
+employeeId y email EXACTOS; el resto se genera con uuid5 como siempre. Así los usuarios que inician sesión
+en hcm-auth tienen marcaciones, licencias, metas, evaluaciones y SUMMARY propios.
 """
 import math
 import random
@@ -71,7 +75,39 @@ def pk(tenant):
 
 
 # ───────────────────────── personas (compartidas) ─────────────────────────
-# Un mismo employeeId (uuid5) se usa en core_hr, payroll, performance y attendance.
+# Un mismo employeeId se usa en core_hr, payroll, performance y attendance.
+
+_USERS = {}  # {tenant: [usuario]} cargado con use_users(); vacío => solo empleados uuid5
+
+
+def use_users(users):
+    """Fija los usuarios demo por tenant (salida de seed_config.load_users)."""
+    _USERS.clear()
+    _USERS.update(users or {})
+    employee.cache_clear()
+
+
+def users_of(tenant):
+    return _USERS.get(tenant, [])
+
+
+def users_min_n(service, k):
+    """N mínimo por tenant para que los k usuarios reciban datos en `service` (None = no aplica)."""
+    if not k:
+        return None
+    if service == "performance":
+        return k * (C.PERF_GOALS_PER_EMPLOYEE + len(perf_cycles()) * len(C.PERF_RELATIONSHIPS))
+    if service in ("core_hr", "payroll", "attendance"):
+        return k
+    return None
+
+
+def users_pool_error(k):
+    """Los pools de empleados configurados deben alcanzar para todos los usuarios."""
+    for name, size in (("SEED_ATTENDANCE_EMPLOYEES", C.ATTENDANCE_EMPLOYEES), ("SEED_PAYROLL_EMPLOYEES", C.PAYROLL_EMPLOYEES)):
+        if size < k:
+            return f"{name}={size} es menor que los {k} usuarios del tenant"
+    return None
 
 DEPARTMENTS = [
     "Tecnología", "Recursos Humanos", "Finanzas", "Operaciones", "Ventas", "Marketing", "Logística",
@@ -85,7 +121,7 @@ def employee(tenant, i):
     r = rng_for(tenant, "employee", i)
     _faker.seed_instance(r.getrandbits(32))
     first, last = _faker.first_name()[:50], _faker.last_name()[:50]
-    return {
+    emp = {
         "employeeId": det_uuid(tenant, "employee", i),
         "firstName": first,
         "lastName": last,
@@ -97,6 +133,13 @@ def employee(tenant, i):
         "status": "ACTIVE" if r.random() < 0.95 else "INACTIVE",
         "contractType": r.choice(C.CONTRACT_TYPES),
     }
+    users = users_of(tenant)
+    if i < len(users):  # usuario demo: su employeeId y email exactos, siempre activo
+        u = users[i]
+        emp.update(employeeId=u["employeeId"], status="ACTIVE")
+        if u.get("email"):
+            emp["email"] = u["email"]
+    return emp
 
 
 # ───────────────────────── core_hr (RDS) ─────────────────────────
@@ -546,7 +589,8 @@ def attendance_items(tenant, n):
         )
 
     # Licencias futuras, sin solapamiento por empleado: ventanas de 15 días, duración 1–5.
-    for j in range(max(1, round(n * C.LEAVES_RATIO))):
+    # Las j < k caen en los k usuarios demo (e = j), así que cada usuario tiene al menos una.
+    for j in range(max(1, round(n * C.LEAVES_RATIO), len(users_of(tenant)))):
         k, e = divmod(j, emps)
         emp = employee(tenant, e)
         r = rng_for(tenant, "leave", j)

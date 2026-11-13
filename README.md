@@ -1,6 +1,6 @@
 # HCM SaaS — Eventos, Asistencia y Seeding
 
-Parte del **Event & Data Engineer** del SaaS HCM multi-tenant (CS2032, UTEC). Tenants: `tenant_a`, `tenant_b`, `tenant_c`.
+Parte del **Event & Data Engineer** del SaaS HCM multi-tenant (CS2032, UTEC). Tenants: `tenant_a`, `tenant_b`, `tenant_c` (los de los usuarios demo de `hcm-auth`, en [`scripts/users.json`](scripts/users.json)).
 
 ```
 events/                    Stack hcm-events: topics SNS, colas SQS + DLQ, tabla de idempotencia
@@ -8,6 +8,7 @@ events/                    Stack hcm-events: topics SNS, colas SQS + DLQ, tabla 
   contracts/               JSON Schema por evento + README con catálogo y ejemplos
 services/attendance/       ms-attendance (DynamoDB) + workers SQS
 scripts/                   Seeding masivo: 10,000 por tenant y microservicio (ver scripts/README.md)
+  users.json               Usuarios demo de hcm-auth (tenantId + employeeId) que usa el seeding
 reference/                 Código de recruitment/performance (compañera, solo lectura)
 ```
 
@@ -46,29 +47,37 @@ y **no** usan `serverless-iam-roles-per-function` ni `iamRoleStatements`.
 
 ### 3. Orden de despliegue
 
-```
-1. hcm-recruitment, hcm-performance   (reference/, tras la migración de IAM)
-2. hcm-events                         (importa hcm-recruitment-${stage}-topic-arn)
-3. hcm-attendance                     (importa el topic y las colas de hcm-events)
-```
+| # | Stack | Directorio | Comando (stage `dev`) | Debe existir al terminar |
+|---|---|---|---|---|
+| 1 | `hcm-auth-dev` | repo de infraestructura (`~/hcm-auth`) | deploy según su README; usuarios: `USERS_TABLE=hcm-auth-users-dev npm run seed:users` | output **`AuthorizerArn`** (export `hcm-auth-dev-AuthorizerArn`) |
+| 2 | `hcm-recruitment-dev`, `hcm-performance-dev` | `reference/recruitment-performance/services/recruitment` y `…/performance` (tras migrar IAM) | `npx serverless deploy --stage dev --param="senderEmail=<correo-SES>"` (+ `--param="storageBucket=hcm-app-storage"` en recruitment) | export **`hcm-recruitment-dev-topic-arn`**; tablas `ms-recruitment-table-dev`, `ms-performance-table-dev` |
+| 3 | `hcm-events-dev` | `events/` | `npx serverless deploy --config serverless-events.yml --stage dev` | 10 exports **`hcm-events-dev-*`** (topics, colas, DLQ, `idempotency-table-name`) |
+| 4 | `hcm-attendance-dev` | `services/attendance/` | `npx serverless deploy --stage dev` | export **`hcm-attendance-dev-table-name`** y los 5 endpoints |
+| 5 | seeding | `scripts/` | `python seed_master.py` y luego `python seed_master.py --verify` | `--verify` todo `OK` (código 0), incluida la tabla de usuarios demo |
 
-```bash
-cd events && npm install && npm run deploy                 # = serverless deploy --config serverless-events.yml
-cd ../services/attendance && npm install && npx serverless deploy
-# con Cognito (cuando exista el User Pool):
-npx serverless deploy --param="cognitoUserPoolArn=arn:aws:cognito-idp:us-east-1:<acct>:userpool/<poolId>"
-```
+Todos los `serverless deploy` requieren `LAB_ROLE_ARN` exportada. Para otro stage, cambiar `dev` en **todos** los pasos.
 
-Stage distinto de `dev`: añadir `--stage <stage>` a **todos** los comandos (los nombres e imports dependen del stage).
+Detalle de cada paso y verificaciones: [`DEPLOY.md`, sección 4](DEPLOY.md#4-orden-de-despliegue).
 
 > ⚠️ Mientras `hcm-events` exista, recruitment **no puede borrar ni renombrar** su export `hcm-recruitment-${stage}-topic-arn` (ni hacer `serverless remove`). Bajar primero `hcm-events` (`cd events && npm run remove`).
 
-### Authorizer (Cognito)
+### Authorizer (hcm-auth)
 
-Param opcional `cognitoUserPoolArn`:
+Los 5 endpoints usan el **Lambda Authorizer TOKEN** del stack `hcm-auth-${stage}` (integrante de infraestructura). Este stack no crea otra Lambda authorizer: la referencia por ARN.
 
-- **Sin param**: endpoints sin authorizer (igual que hoy en `reference/`). Solo para pruebas.
-- **Con param**: todos los endpoints de attendance usan un authorizer `COGNITO_USER_POOLS` y el tenant sale del claim `custom:tenant_id`.
+```yaml
+custom:
+  authorizerArn: ${param:authorizerArn, cf:hcm-auth-${sls:stage}.AuthorizerArn}
+  authorizer:
+    arn: ${self:custom.authorizerArn}
+    type: token
+    resultTtlInSeconds: 0
+```
+
+- Se usa `${cf:hcm-auth-<stage>.AuthorizerArn}` (output del stack; export `hcm-auth-<stage>-AuthorizerArn`) y **no** `!ImportValue`, porque Serverless v3 necesita `authorizer.arn` como string. `${cf:}` se resuelve al empaquetar, así que `hcm-auth` debe estar desplegado antes y hacen falta credenciales.
+- En una REST API la configuración del authorizer es por API: CloudFormation crea en este stack un `AWS::ApiGateway::Authorizer` (que apunta a la Lambda de hcm-auth) y un `AWS::Lambda::Permission` para que API Gateway la invoque. No se crea ninguna Lambda nueva.
+- El param `authorizerArn` solo sirve para `serverless print/package/offline` sin AWS (ver Tests). En el deploy no se pasa.
+- Identidad en la Lambda: `event.requestContext.authorizer.{tenantId, role, employeeId, userId, email}` (context plano, sin `custom:` ni `claims`). Solo `lib/http.js` (`getAuthContext`/`getTenantId`) conoce esa ruta.
 
 ---
 
@@ -99,19 +108,20 @@ Reglas:
 - `clock-out` acepta `date` opcional para cerrar un turno nocturno iniciado el día anterior. Calcula `workedMinutes`.
 - `type`: `VACATION | SICK | UNPAID | OTHER`. `endDate >= startDate`, máx. 365 días. Salvo `SICK`, `startDate` debe ser hoy o futura. Solapamiento con licencias `PENDING`/`APPROVED` del mismo empleado → 409 (consulta por GSI1).
 - Aprobar calcula `daysUnpaid` (días calendario inclusivos; `UNPAID`/`OTHER` = todos, `VACATION`/`SICK` = 0) y publica `leave.approved` en `hcm-attendance-${stage}-events`. Si SNS falla tras guardar, se loguea `ERROR` y se responde `notification: "FAILED"` (`QUEUED` si se publicó, `SKIPPED` si no hay topic, p. ej. en offline).
-- Rol (claims opcionales, como en performance): `custom:role = EMPLOYEE` solo puede operar sobre su `custom:employee_id` y no puede aprobar.
-- Tenant: siempre del claim. Si body/path/query/header traen otro tenant → **403 `{ message: "Acceso denegado", requestId }`**.
+- Rol (del authorizer): `role = EMPLOYEE` solo puede operar sobre su propio `employeeId` y no puede aprobar. `ADMIN` y `HR` operan sobre cualquier empleado del tenant.
+- Tenant: siempre de `requestContext.authorizer.tenantId`. Si body/path/query/header traen otro tenant → **403 `{ message: "Acceso denegado", requestId }`**.
+- `lib/dynamoTenantFilter.js` sigue siendo copia exacta de `reference/`. Su `tenantFromEvent` lee la ruta antigua (`claims["custom:tenant_id"]`), pero attendance no lo usa: el tenant se resuelve solo en `lib/http.js`. `assertRequestTenant` no depende del authorizer (compara body/path/query/header con el tenant ya resuelto).
 
 Errores: `{ message, requestId }` — 400 validación, 401 sin tenant, 403 tenant ajeno/rol, 404, 409 conflicto, 503 throttling DynamoDB, 500 resto.
 
 ### Probar en local (serverless offline)
 
-En local no hay Cognito: el tenant va en `x-tenant-id` (solo válido con `IS_OFFLINE`, que pone serverless-offline). Usa DynamoDB real de AWS, así que hacen falta las credenciales del lab y la tabla desplegada.
+serverless-offline **no ejecuta authorizers por ARN** (avisa *does not support non local authorizers* y deja pasar): el tenant va en `x-tenant-id` (solo válido con `IS_OFFLINE`, que pone serverless-offline). Usa DynamoDB real de AWS, así que hacen falta las credenciales del lab y la tabla desplegada.
 
 ```bash
 cd services/attendance
 set -a && source ../../.env && set +a
-npx serverless offline
+npx serverless offline          # con hcm-auth desplegado; si no: --param="authorizerArn=arn:aws:lambda:us-east-1:000000000000:function:x"
 
 B=http://localhost:3000/dev
 curl -X POST $B/attendance/clock-in  -H 'x-tenant-id: tenant_a' -H 'content-type: application/json' -d '{"employeeId":"emp-102"}'
@@ -127,21 +137,57 @@ curl -X POST $B/attendance/clock-in -H 'x-tenant-id: tenant_a' -H 'content-type:
 
 En offline el `!ImportValue` del topic no se resuelve, así que `approve` responde `notification: "SKIPPED"`.
 
-### Probar en AWS (JWT)
+### Probar en AWS (JWT de hcm-auth)
+
+**1. Token.** Login HTTP del stack `hcm-auth` (no Cognito). Usuarios demo en `scripts/users.json`; la contraseña de los usuarios demo la define hcm-auth (pedirla a infraestructura; no se guarda en este repo). Los usuarios existen solo si se crearon con `USERS_TABLE=hcm-auth-users-dev npm run seed:users` en su repo. JWT HS256, válido 8 h.
 
 ```bash
-B=https://<api-id>.execute-api.us-east-1.amazonaws.com/dev
-TOKEN=<idToken de Cognito con custom:tenant_id>
-curl -X POST $B/attendance/clock-in -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"employeeId":"emp-102"}'
-curl "$B/attendance?employeeId=emp-102" -H "Authorization: Bearer $TOKEN"
+AUTH_API=https://0kcyrpixu6.execute-api.us-east-1.amazonaws.com/dev    # API de hcm-auth (en .env.example)
+login() { curl -s -X POST "$AUTH_API/auth/login" -H 'content-type: application/json' \
+  -d "{\"email\":\"$1\",\"password\":\"${2:-<contraseña-demo>}\"}" | jq -r .token; }
+
+TA=$(login hr@empresa-a.com)          # HR de tenant_a  (employeeId emp-a-hr)
+TE=$(login empleado@empresa-a.com)    # EMPLOYEE de tenant_a (emp-a-001)
+TB=$(login hr@empresa-b.com)          # HR de tenant_b
+echo "$TA" | cut -d. -f2 | base64 -d 2>/dev/null; echo    # ver tenantId/role/employeeId del payload
 ```
 
-Si además se envía `x-tenant-id` y no coincide con el token → 403.
+La respuesta del login trae `token`, `expiresIn` y `user`. A attendance se le envía `Authorization: Bearer <token>`.
+
+**2. Los 5 endpoints** (`API` = URL base que imprime `serverless deploy` de attendance):
+
+```bash
+API=https://<api-id>.execute-api.us-east-1.amazonaws.com/dev
+A=(-H "Authorization: Bearer $TA" -H 'content-type: application/json')
+
+curl -s -X POST $API/attendance/clock-in  "${A[@]}" -d '{"employeeId":"emp-a-001"}'                           # 201 (409 si ya marcó hoy)
+curl -s -X POST $API/attendance/clock-out "${A[@]}" -d '{"employeeId":"emp-a-001"}'                           # 200
+curl -s "$API/attendance?employeeId=emp-a-001&limit=5" -H "Authorization: Bearer $TA" | jq '.count,.nextToken'  # sembrados + hoy
+S=$(date -d '+40 days' +%F); E=$(date -d '+42 days' +%F)                                                     # macOS: date -v+40d +%F
+LEAVE=$(curl -s -X POST $API/leaves/request "${A[@]}" -d '{"employeeId":"emp-a-001","type":"UNPAID","startDate":"'$S'","endDate":"'$E'"}' | jq -r .leave.leaveId)
+curl -s -X POST $API/leaves/$LEAVE/approve "${A[@]}" -d '{"note":"OK"}' | jq '.leave.status,.notification'    # "APPROVED", "QUEUED"
+```
+
+Rol `EMPLOYEE` (`$TE`): `clock-in` con su propio `emp-a-001` → 201; con `emp-a-hr` → 403 `"Solo puedes operar sobre tus propios registros"`; `approve` → 403.
+
+Sin token o con token inválido → **401 de API Gateway** (no llega a la Lambda).
+
+**3. Aislamiento** (token de `tenant_b` contra datos de `tenant_a`):
+
+| Caso | Comando | Esperado |
+|---|---|---|
+| tenant_b lista a un empleado de tenant_a | `curl -s "$API/attendance?employeeId=emp-a-001" -H "Authorization: Bearer $TB" \| jq .count` | `0` (otra partición) |
+| tenant_b aprueba una licencia de tenant_a | `curl -s -X POST $API/leaves/$LEAVE/approve -H "Authorization: Bearer $TB" -H 'content-type: application/json' -d '{}'` | 404 `"Licencia no encontrada"` |
+| token de tenant_b + `tenantId: tenant_a` en el body | `curl -s -X POST $API/attendance/clock-in -H "Authorization: Bearer $TB" -H 'content-type: application/json' -d '{"employeeId":"emp-b-001","tenantId":"tenant_a"}'` | 403 `{"message":"Acceso denegado",…}` |
+| token de tenant_b + header `x-tenant-id: tenant_a` | `curl -s "$API/attendance?employeeId=emp-b-001" -H "Authorization: Bearer $TB" -H 'x-tenant-id: tenant_a'` | 403 |
 
 ### Tests
 
 ```bash
 cd services/attendance && npm test
+# Validar la plantilla sin AWS (no resuelve ${cf:}): ARN y rol falsos
+LAB_ROLE_ARN=arn:aws:iam::000000000000:role/LabRole npx serverless package --stage dev \
+  --param="authorizerArn=arn:aws:lambda:us-east-1:000000000000:function:hcm-auth-dev-authorizer"
 ```
 
 ---
@@ -189,7 +235,7 @@ fields @timestamp, level, msg, tenantId, eventType, messageId, eventKey
 
    ```bash
    cd services/attendance
-   npx serverless deploy --param="simulateFailure=true"     # (+ cognitoUserPoolArn si aplica)
+   npx serverless deploy --param="simulateFailure=true"
    ```
 
 2. Publicar un `leave.approved` válido en el topic (o aprobar una licencia con `POST /leaves/{id}/approve`):
@@ -237,7 +283,7 @@ python seed_master.py                    # carga completa (idempotente: se puede
 python seed_master.py --verify           # tabla por tenant / servicio / entidad
 ```
 
-Ejecutarlo **después** de desplegar recruitment, performance y attendance (las tablas deben existir). Si el RDS aún no está, core_hr y payroll fallan con un mensaje claro y el resto se siembra igual. Detalles, decisiones y limitaciones en [`scripts/README.md`](scripts/README.md).
+Ejecutarlo **después** de desplegar recruitment, performance y attendance (las tablas deben existir). Tenants y `employeeId` de los usuarios demo salen de [`scripts/users.json`](scripts/users.json) (`SEED_USERS_FILE`): esos usuarios reciben marcaciones, licencias, metas y evaluaciones con SUMMARY en 2026-Q3 y 2026-Q4, así que al iniciar sesión ven datos. Si se cambia un `employeeId` en hcm-auth, hay que cambiarlo también en `users.json` y volver a sembrar. Si el RDS aún no está, core_hr y payroll fallan con un mensaje claro y el resto se siembra igual. Detalles, decisiones y limitaciones en [`scripts/README.md`](scripts/README.md).
 
 ---
 
@@ -257,6 +303,7 @@ Ejecutarlo **después** de desplegar recruitment, performance y attendance (las 
 | DLQs | `<cola>-dlq` | `hcm-events-${stage}-<cola>-dlq-url` (URL) |
 | Tabla idempotencia | `hcm-events-idempotency-${stage}` | `hcm-events-${stage}-idempotency-table-name` |
 | Tabla asistencia | `ms-attendance-table-${stage}` | `hcm-attendance-${stage}-table-name` |
+| Authorizer *(de hcm-auth)* | `hcm-auth-${stage}-authorizer` (Lambda) | `hcm-auth-${stage}-AuthorizerArn` (output `AuthorizerArn`) |
 
 Uso desde otro `serverless.yml`:
 

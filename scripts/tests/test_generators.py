@@ -26,6 +26,7 @@ PHONE_RE = re.compile(r"^\+?[0-9\s-]{6,20}$")
 
 @pytest.fixture(scope="module")
 def data():
+    G.use_users(C.load_users())  # module scope: se instancia antes que la autouse demo_users
     return {(s, t): G.generate(s, t, N) for s in C.SERVICES for t in TENANTS}
 
 
@@ -288,3 +289,97 @@ def test_deterministico_y_aislado_por_tenant():
     b = G.generate("recruitment", "tenant_b", 200)
     assert a1 == a2
     assert not {i["SK"] for i in a1} & {i["SK"] for i in b}
+
+
+# ───────────── usuarios demo (scripts/users.json) ─────────────
+
+
+def test_usuarios_demo_usan_su_employeeId_exacto_en_los_4_servicios(data, demo_users):
+    for t in TENANTS:
+        ids = [u["employeeId"] for u in demo_users[t]]
+        assert ids, f"{t} sin usuarios"
+        core = data[("core_hr", t)]
+        emps = {e["id"]: e for e in core["employees"]}
+        perf, att = data[("performance", t)], data[("attendance", t)]
+        for u in demo_users[t]:
+            e = u["employeeId"]
+            assert EMPLOYEE_RE.match(e)
+            assert emps[e]["email"] == u["email"] and emps[e]["status"] == "ACTIVE"
+            assert any(c["employee_id"] == e for c in core["contracts"])
+            assert any(s["employee_id"] == e for s in data[("payroll", t)]["pay_slips"])
+            assert sum(a["employeeId"] == e for a in by_type(att, "ATTENDANCE")) == 100  # 100 días hábiles
+            assert any(l["employeeId"] == e for l in by_type(att, "LEAVE"))
+            assert {s["cycle"] for s in by_type(perf, "EVAL_SUMMARY") if s["employeeId"] == e} == {"2026-Q3", "2026-Q4"}
+            assert sum(ev["employeeId"] == e for ev in by_type(perf, "EVALUATION")) == 8
+            goals = [g for g in by_type(perf, "GOAL") if g["employeeId"] == e]
+            assert len(goals) == 2 and all(g["reminder"]["enabled"] is False and "GSI1PK" not in g for g in goals)
+        # el resto sigue siendo uuid5 determinístico
+        assert len(emps) == N and sum(1 for x in emps if x in ids) == len(ids)
+
+
+def test_usuarios_con_muestra_pequena_tambien_tienen_datos(demo_users):
+    for t, users in demo_users.items():
+        perf = G.generate("performance", t, 100)
+        att = G.generate("attendance", t, 100)
+        for u in users:
+            e = u["employeeId"]
+            assert {s["cycle"] for s in by_type(perf, "EVAL_SUMMARY") if s["employeeId"] == e} == {"2026-Q3", "2026-Q4"}
+            assert any(l["employeeId"] == e for l in by_type(att, "LEAVE"))
+        assert G.count_by_entity("attendance", att)["ATTENDANCE"] == 100
+        perf_c = G.count_by_entity("performance", perf)
+        assert perf_c["GOAL"] + perf_c["EVALUATION"] == 100
+
+
+def test_sin_usuarios_se_genera_como_antes():
+    G.use_users({})
+    assert G.employee("tenant_a", 0)["employeeId"] == G.det_uuid("tenant_a", "employee", 0)
+    assert G.count_by_entity("attendance", G.generate("attendance", "tenant_a", 10_000))["LEAVE"] == 200
+
+
+def test_users_min_n():
+    assert G.users_min_n("performance", 3) == 30
+    assert G.users_min_n("attendance", 3) == 3
+    assert G.users_min_n("recruitment", 3) is None
+    assert G.users_min_n("performance", 0) is None
+
+
+# ───────────── validación del archivo de usuarios ─────────────
+
+
+def write(tmp_path, content):
+    p = tmp_path / "users.json"
+    p.write_text(content if isinstance(content, str) else __import__("json").dumps(content))
+    return str(p)
+
+
+def test_load_users_archivo_real():
+    users = C.load_users()
+    assert list(users) == ["tenant_a", "tenant_b", "tenant_c"]
+    assert [u["employeeId"] for u in users["tenant_a"]] == ["emp-a-admin", "emp-a-hr", "emp-a-001"]
+
+
+@pytest.mark.parametrize(
+    "content, msg",
+    [
+        ("{no es json", "no se pudo leer"),
+        ([], "lista no vacía"),
+        ([{"tenantId": "tenant_a", "employeeId": "emp a"}], "employeeId 'emp a' no cumple"),
+        ([{"tenantId": "tenant_a", "employeeId": "x" * 65}], "no cumple ^[A-Za-z0-9_-]{1,64}$"),
+        ([{"tenantId": "tenant a", "employeeId": "emp-1"}], "tenantId 'tenant a' no cumple"),
+        ([{"tenantId": "tenant_a"}], "employeeId None no cumple"),
+        ([{"tenantId": "tenant_a", "employeeId": "e1"}, {"tenantId": "tenant_a", "employeeId": "e1"}], "employeeId e1 repetido"),
+        ({"tenants": ["tenant_a", "tenant_b"], "users": [{"tenantId": "tenant_a", "employeeId": "e1"}]}, "el tenant tenant_b no tiene usuarios"),
+    ],
+)
+def test_load_users_invalido(tmp_path, content, msg):
+    with pytest.raises(C.UsersFileError) as e:
+        C.load_users(write(tmp_path, content))
+    assert msg in str(e.value)
+
+
+def test_load_users_tenant_pedido_sin_usuarios(tmp_path):
+    path = write(tmp_path, [{"tenantId": "tenant_a", "employeeId": "e1"}])
+    with pytest.raises(C.UsersFileError, match="el tenant tenant_c no tiene usuarios"):
+        C.load_users(path, ["tenant_a", "tenant_c"])
+    with pytest.raises(C.UsersFileError, match="no existe el archivo"):
+        C.load_users(str(tmp_path / "nope.json"))
