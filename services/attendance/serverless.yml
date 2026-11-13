@@ -87,6 +87,15 @@ functions:
           cors: true
           authorizer: ${self:custom.authorizer}
 
+  deleteAttendance:
+    handler: handlers/deleteAttendance.main
+    events:
+      - http:
+          path: /attendance/{employeeId}/{date}
+          method: delete
+          cors: true
+          authorizer: ${self:custom.authorizer}
+
   # ─────────────── Workers SQS (colas de hcm-events) ───────────────
   # Temporales: cuando ms-payroll / ms-core-hr tengan su propio consumidor, borrar la función
   # correspondiente en el mismo despliegue (una cola = un consumidor).
