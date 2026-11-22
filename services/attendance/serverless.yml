@@ -99,6 +99,7 @@ functions:
     events:
       - sqs:
           arn: !ImportValue hcm-events-${sls:stage}-payroll-attendance-sync-queue-arn
+          enabled: false
           batchSize: 10
           functionResponseType: ReportBatchItemFailures
 
@@ -111,6 +112,7 @@ functions:
     events:
       - sqs:
           arn: !ImportValue hcm-events-${sls:stage}-hr-recruitment-sync-queue-arn
+          enabled: false
           batchSize: 10
           functionResponseType: ReportBatchItemFailures
 
