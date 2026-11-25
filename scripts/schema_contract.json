@@ -1,0 +1,452 @@
+[
+  [
+    "contracts",
+    "column",
+    "contract_id uuid true   gen_random_uuid()"
+  ],
+  [
+    "contracts",
+    "column",
+    "contract_type character varying(30) true   "
+  ],
+  [
+    "contracts",
+    "column",
+    "employee_id uuid true   "
+  ],
+  [
+    "contracts",
+    "column",
+    "end_date date false   "
+  ],
+  [
+    "contracts",
+    "column",
+    "s3_contract_key text false   "
+  ],
+  [
+    "contracts",
+    "column",
+    "salary numeric(10,2) true   "
+  ],
+  [
+    "contracts",
+    "column",
+    "start_date date true   "
+  ],
+  [
+    "contracts",
+    "constraint",
+    "contracts_contract_type_check CHECK (((contract_type)::text = ANY ((ARRAY['FULL_TIME'::character varying, 'PART_TIME'::character varying, 'CONTRACTOR'::character varying])::text[]))) true"
+  ],
+  [
+    "contracts",
+    "constraint",
+    "contracts_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES tenant_X.employees(employee_id) ON DELETE CASCADE true"
+  ],
+  [
+    "contracts",
+    "constraint",
+    "contracts_pkey PRIMARY KEY (contract_id) true"
+  ],
+  [
+    "contracts",
+    "constraint",
+    "contracts_salary_check CHECK ((salary > (0)::numeric)) true"
+  ],
+  [
+    "contracts",
+    "index",
+    "CREATE INDEX idx_contracts_employee ON tenant_X.contracts USING btree (employee_id) true true"
+  ],
+  [
+    "contracts",
+    "index",
+    "CREATE UNIQUE INDEX contracts_pkey ON tenant_X.contracts USING btree (contract_id) true true"
+  ],
+  [
+    "contracts",
+    "table",
+    "rpfalsefalsefalse"
+  ],
+  [
+    "departments",
+    "column",
+    "budget numeric(12,2) true   "
+  ],
+  [
+    "departments",
+    "column",
+    "created_at timestamp without time zone false   CURRENT_TIMESTAMP"
+  ],
+  [
+    "departments",
+    "column",
+    "department_id uuid true   gen_random_uuid()"
+  ],
+  [
+    "departments",
+    "column",
+    "name character varying(100) true   "
+  ],
+  [
+    "departments",
+    "constraint",
+    "departments_pkey PRIMARY KEY (department_id) true"
+  ],
+  [
+    "departments",
+    "constraint",
+    "uk_tenant_X_departments_name UNIQUE (name) true"
+  ],
+  [
+    "departments",
+    "index",
+    "CREATE UNIQUE INDEX departments_pkey ON tenant_X.departments USING btree (department_id) true true"
+  ],
+  [
+    "departments",
+    "index",
+    "CREATE UNIQUE INDEX uk_tenant_X_departments_name ON tenant_X.departments USING btree (name) true true"
+  ],
+  [
+    "departments",
+    "table",
+    "rpfalsefalsefalse"
+  ],
+  [
+    "employee_salary_profiles",
+    "column",
+    "base_salary numeric(10,2) true   "
+  ],
+  [
+    "employee_salary_profiles",
+    "column",
+    "email character varying(120) true   "
+  ],
+  [
+    "employee_salary_profiles",
+    "column",
+    "employee_id uuid true   "
+  ],
+  [
+    "employee_salary_profiles",
+    "column",
+    "hire_date date true   "
+  ],
+  [
+    "employee_salary_profiles",
+    "column",
+    "is_active boolean false   true"
+  ],
+  [
+    "employee_salary_profiles",
+    "column",
+    "synced_at timestamp without time zone false   CURRENT_TIMESTAMP"
+  ],
+  [
+    "employee_salary_profiles",
+    "constraint",
+    "employee_salary_profiles_pkey PRIMARY KEY (employee_id) true"
+  ],
+  [
+    "employee_salary_profiles",
+    "index",
+    "CREATE UNIQUE INDEX employee_salary_profiles_pkey ON tenant_X.employee_salary_profiles USING btree (employee_id) true true"
+  ],
+  [
+    "employee_salary_profiles",
+    "table",
+    "rpfalsefalsefalse"
+  ],
+  [
+    "employees",
+    "column",
+    "created_at timestamp without time zone false   CURRENT_TIMESTAMP"
+  ],
+  [
+    "employees",
+    "column",
+    "department_id uuid false   "
+  ],
+  [
+    "employees",
+    "column",
+    "email character varying(120) true   "
+  ],
+  [
+    "employees",
+    "column",
+    "employee_id uuid true   gen_random_uuid()"
+  ],
+  [
+    "employees",
+    "column",
+    "first_name character varying(50) true   "
+  ],
+  [
+    "employees",
+    "column",
+    "hire_date date false   "
+  ],
+  [
+    "employees",
+    "column",
+    "last_name character varying(50) true   "
+  ],
+  [
+    "employees",
+    "column",
+    "role character varying(30) false   'EMPLOYEE'::character varying"
+  ],
+  [
+    "employees",
+    "column",
+    "source_candidate_id character varying(100) false   "
+  ],
+  [
+    "employees",
+    "column",
+    "status character varying(20) false   'ACTIVE'::character varying"
+  ],
+  [
+    "employees",
+    "constraint",
+    "employees_department_id_fkey FOREIGN KEY (department_id) REFERENCES tenant_X.departments(department_id) true"
+  ],
+  [
+    "employees",
+    "constraint",
+    "employees_pkey PRIMARY KEY (employee_id) true"
+  ],
+  [
+    "employees",
+    "constraint",
+    "employees_status_check CHECK (((status)::text = ANY ((ARRAY['ACTIVE'::character varying, 'INACTIVE'::character varying, 'ON_LEAVE'::character varying, 'PENDING_ONBOARDING'::character varying])::text[]))) true"
+  ],
+  [
+    "employees",
+    "constraint",
+    "uk_tenant_X_employees_email UNIQUE (email) true"
+  ],
+  [
+    "employees",
+    "index",
+    "CREATE INDEX idx_employees_department ON tenant_X.employees USING btree (department_id) true true"
+  ],
+  [
+    "employees",
+    "index",
+    "CREATE INDEX idx_employees_fullname ON tenant_X.employees USING btree (last_name, first_name) true true"
+  ],
+  [
+    "employees",
+    "index",
+    "CREATE INDEX idx_employees_status_created ON tenant_X.employees USING btree (status, created_at DESC) true true"
+  ],
+  [
+    "employees",
+    "index",
+    "CREATE UNIQUE INDEX employees_pkey ON tenant_X.employees USING btree (employee_id) true true"
+  ],
+  [
+    "employees",
+    "index",
+    "CREATE UNIQUE INDEX idx_employees_source_candidate_id ON tenant_X.employees USING btree (source_candidate_id) WHERE (source_candidate_id IS NOT NULL) true true"
+  ],
+  [
+    "employees",
+    "index",
+    "CREATE UNIQUE INDEX uk_tenant_X_employees_email ON tenant_X.employees USING btree (email) true true"
+  ],
+  [
+    "employees",
+    "table",
+    "rpfalsefalsefalse"
+  ],
+  [
+    "pay_slips",
+    "column",
+    "base_salary numeric(10,2) true   "
+  ],
+  [
+    "pay_slips",
+    "column",
+    "deductions numeric(10,2) false   0.00"
+  ],
+  [
+    "pay_slips",
+    "column",
+    "employee_id uuid true   "
+  ],
+  [
+    "pay_slips",
+    "column",
+    "generated_at timestamp without time zone false   CURRENT_TIMESTAMP"
+  ],
+  [
+    "pay_slips",
+    "column",
+    "net_pay numeric(10,2) true   "
+  ],
+  [
+    "pay_slips",
+    "column",
+    "pay_slip_id uuid true   gen_random_uuid()"
+  ],
+  [
+    "pay_slips",
+    "column",
+    "period_id uuid true   "
+  ],
+  [
+    "pay_slips",
+    "column",
+    "s3_slip_key text false   "
+  ],
+  [
+    "pay_slips",
+    "constraint",
+    "pay_slips_period_id_fkey FOREIGN KEY (period_id) REFERENCES tenant_X.payroll_periods(period_id) true"
+  ],
+  [
+    "pay_slips",
+    "constraint",
+    "pay_slips_pkey PRIMARY KEY (pay_slip_id) true"
+  ],
+  [
+    "pay_slips",
+    "constraint",
+    "uk_tenant_X_pay_slips_period_employee UNIQUE (period_id, employee_id) true"
+  ],
+  [
+    "pay_slips",
+    "index",
+    "CREATE INDEX idx_payslips_employee ON tenant_X.pay_slips USING btree (employee_id) true true"
+  ],
+  [
+    "pay_slips",
+    "index",
+    "CREATE INDEX idx_payslips_period_generated ON tenant_X.pay_slips USING btree (period_id, generated_at DESC) true true"
+  ],
+  [
+    "pay_slips",
+    "index",
+    "CREATE UNIQUE INDEX pay_slips_pkey ON tenant_X.pay_slips USING btree (pay_slip_id) true true"
+  ],
+  [
+    "pay_slips",
+    "index",
+    "CREATE UNIQUE INDEX uk_tenant_X_pay_slips_period_employee ON tenant_X.pay_slips USING btree (period_id, employee_id) true true"
+  ],
+  [
+    "pay_slips",
+    "table",
+    "rpfalsefalsefalse"
+  ],
+  [
+    "payroll_periods",
+    "column",
+    "created_at timestamp without time zone false   CURRENT_TIMESTAMP"
+  ],
+  [
+    "payroll_periods",
+    "column",
+    "is_closed boolean false   false"
+  ],
+  [
+    "payroll_periods",
+    "column",
+    "period_id uuid true   gen_random_uuid()"
+  ],
+  [
+    "payroll_periods",
+    "column",
+    "period_name character varying(7) true   "
+  ],
+  [
+    "payroll_periods",
+    "column",
+    "total_paid numeric(14,2) false   0.00"
+  ],
+  [
+    "payroll_periods",
+    "constraint",
+    "payroll_periods_pkey PRIMARY KEY (period_id) true"
+  ],
+  [
+    "payroll_periods",
+    "constraint",
+    "uk_tenant_X_payroll_periods_name UNIQUE (period_name) true"
+  ],
+  [
+    "payroll_periods",
+    "index",
+    "CREATE UNIQUE INDEX payroll_periods_pkey ON tenant_X.payroll_periods USING btree (period_id) true true"
+  ],
+  [
+    "payroll_periods",
+    "index",
+    "CREATE UNIQUE INDEX uk_tenant_X_payroll_periods_name ON tenant_X.payroll_periods USING btree (period_name) true true"
+  ],
+  [
+    "payroll_periods",
+    "table",
+    "rpfalsefalsefalse"
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "column",
+    "applied boolean false   false"
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "column",
+    "days_unpaid integer true   "
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "column",
+    "employee_id uuid true   "
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "column",
+    "leave_id uuid true   gen_random_uuid()"
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "column",
+    "period_target character varying(7) true   "
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "column",
+    "processed_at timestamp without time zone false   CURRENT_TIMESTAMP"
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "constraint",
+    "unpaid_leaves_ledger_days_unpaid_check CHECK ((days_unpaid > 0)) true"
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "constraint",
+    "unpaid_leaves_ledger_pkey PRIMARY KEY (leave_id) true"
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "index",
+    "CREATE INDEX idx_unpaid_leaves_period_applied ON tenant_X.unpaid_leaves_ledger USING btree (period_target, applied) true true"
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "index",
+    "CREATE UNIQUE INDEX unpaid_leaves_ledger_pkey ON tenant_X.unpaid_leaves_ledger USING btree (leave_id) true true"
+  ],
+  [
+    "unpaid_leaves_ledger",
+    "table",
+    "rpfalsefalsefalse"
+  ]
+]

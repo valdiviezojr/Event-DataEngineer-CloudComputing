@@ -1,312 +1,164 @@
 #!/usr/bin/env python3
-"""Seeding masivo del SaaS HCM: 10,000 registros por tenant y microservicio (30,000 con 3 tenants).
-
-Ejemplos:
-  python seed_master.py --dry-run                                  # genera y cuenta, sin tocar AWS/RDS
-  python seed_master.py --service recruitment performance --sample # 100 por tenant
-  python seed_master.py                                            # todo, 10,000 por tenant
-  python seed_master.py --verify                                   # solo cuenta lo que hay
-
-Idempotente y reanudable: claves determinísticas (uuid5) + ítems/filas existentes se saltan.
-Si RDS no está disponible, core_hr y payroll fallan con un mensaje claro y el resto continúa.
-Tenants y employeeIds de los usuarios demo salen de users.json (SEED_USERS_FILE / --users-file); si el
-archivo es inválido, el script termina con código 3 antes de escribir nada.
-"""
+"""Carga reproducible con preflight obligatorio y verificación por claves."""
 import argparse
+from contextlib import closing
+from collections import Counter
+from hashlib import sha256
 import json
+import os
+from pathlib import Path
 import sys
-import time
+import tempfile
 
+import dynamo_writer
+import generators
+from preflight import inspect_aws
+import rds_writer
 import seed_config as C
-import generators as G
-from dynamo_writer import BOTO_CONFIG, DynamoSeedError, DynamoWriter, count_entity
-from rds_writer import RdsUnavailable, connect, count_rows, create_schema, insert_rows, missing_tables
+from verify_seed import validate
 
-try:
-    from tqdm import tqdm
-except ImportError:  # el progreso es opcional
-    tqdm = None
-
-RDS_SPECS = {"core_hr": C.CORE_HR, "payroll": C.PAYROLL}
-# --verify por usuario demo: entidad que debe existir para su employeeId (SK = <prefijo><employeeId>#…)
-USER_CHECKS = {"attendance": "ATTENDANCE", "performance": "EVAL_SUMMARY"}
+VERSION = 2
 
 
-def parse_args(argv):
-    p = argparse.ArgumentParser(description="Seeding HCM multi-tenant (RDS + DynamoDB)")
-    p.add_argument("--service", nargs="+", choices=["all"] + C.SERVICES, default=["all"])
-    p.add_argument("--tenants", nargs="+", default=C.TENANTS or None, help="default: SEED_TENANTS o los tenants del archivo de usuarios")
-    p.add_argument("--users-file", default=C.USERS_FILE, help="usuarios demo de hcm-auth (default %(default)s)")
-    p.add_argument("--per-tenant", type=int, default=C.PER_TENANT, help="registros por tenant (default %(default)s)")
-    p.add_argument("--sample", action="store_true", help=f"{C.SAMPLE_PER_TENANT} por tenant (ignora --per-tenant)")
-    p.add_argument("--dry-run", action="store_true", help="genera y muestra conteos/ejemplos sin escribir")
-    p.add_argument("--verify", action="store_true", help="solo cuenta lo que hay en DynamoDB/RDS por tenant")
-    p.add_argument("--conditional", action="store_true", help="DynamoDB: PutItem condicional en vez de BatchWriteItem")
-    p.add_argument("--create-schema", action="store_true", help="RDS: crear schemas/tablas con el DDL del diseño si no existen")
-    p.add_argument("--workers", type=int, default=C.DYNAMO_WORKERS, help="hilos para DynamoDB (default %(default)s)")
-    a = p.parse_args(argv)
-    a.services = C.SERVICES if "all" in a.service else list(dict.fromkeys(a.service))
-    a.n = C.SAMPLE_PER_TENANT if a.sample else a.per_tenant
-    if a.n < 1:
-        p.error("--per-tenant debe ser >= 1")
-    return a
+def encoded(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":")).encode()
 
 
-def load_users(args):
-    """Valida el archivo de usuarios y que N alcance para darles datos. Lanza UsersFileError; no escribe nada."""
-    users = C.load_users(args.users_file, args.tenants)
-    errors = []
-    for t, us in users.items():
-        k = len(us)
-        pool = G.users_pool_error(k)
-        if pool:
-            errors.append(f"{t}: {pool}")
-        for s in args.services:
-            need = G.users_min_n(s, k)
-            if need and args.n < need:
-                errors.append(f"{t}/{s}: con {args.n} por tenant los {k} usuarios no reciben datos completos; usa al menos --per-tenant {need}")
-    if errors:
-        raise C.UsersFileError("los usuarios no caben en el seed:\n  - " + "\n  - ".join(errors))
-    G.use_users(users)
-    args.tenants = list(users)
-    return users
+def digest(value):
+    return sha256(encoded(value)).hexdigest()
 
 
-def bar(total, desc):
-    return tqdm(total=total, desc=desc, unit="it", leave=False) if tqdm else None
+def complementary_counts(data):
+    result = {}
+    for tenant, (tables, services) in data.items():
+        counts = Counter(row["entityType"] for groups in services.values() for group in groups for row in group)
+        result[tenant] = {
+            "departments_reused": len(C.DEPARTMENTS),
+            "departments_inserted": len(tables["departments"]),
+            "contracts": len(tables["contracts"]),
+            "employee_salary_profiles": len(tables["employee_salary_profiles"]),
+            "payroll_periods": len(tables["payroll_periods"]),
+            "payroll_employees": len({row["employee_id"] for row in tables["pay_slips"]}),
+            **{name: counts[name] for name in ("VACANCY", "UNIQUE_GUARD", "EVAL_SUMMARY", "LEAVE")},
+            "unpaid_leaves_ledger": 0,
+        }
+    return result
 
 
-def print_table(headers, rows):
-    widths = [max(len(str(x)) for x in col) for col in zip(headers, *rows)]
-    line = lambda r: "  ".join(str(x).ljust(w) for x, w in zip(r, widths))  # noqa: E731
-    print(line(headers))
-    print("  ".join("-" * w for w in widths))
-    for r in rows:
-        print(line(r))
+def manifest(data, departments, sql_destination, dynamo_destinations):
+    return {
+        "version": VERSION,
+        "namespace": str(C.NAMESPACE), "reference_date": C.REFERENCE_DATE.isoformat(),
+        "hire_date": C.HIRE_DATE.isoformat(), "periods": list(C.PERIODS), "cycles": list(C.CYCLES),
+        "departments": departments, "excluded_auth_ids": list(C.EXCLUDED_AUTH_IDS),
+        "postgresql": sql_destination, "dynamodb": dynamo_destinations,
+        "counts": validate(data), "complementary": complementary_counts(data),
+        "sha256": {tenant: {
+            "postgresql": digest(tables),
+            **{service: digest(groups) for service, groups in services.items()},
+        } for tenant, (tables, services) in data.items()},
+    }
 
 
-class Context:
-    """Recursos compartidos, creados de forma perezosa (dry-run no conecta a nada)."""
-
-    def __init__(self, args, dynamo_client=None, rds_connect=None):
-        self.args = args
-        self._dynamo = dynamo_client
-        self._rds_connect = rds_connect or (lambda: connect(C.RDS))
-        self._rds = None
-        self._rds_error = None
-        self._expected = {}
-        self._user_expected = {}
-
-    @property
-    def dynamo(self):
-        if self._dynamo is None:
-            import boto3
-
-            self._dynamo = boto3.client("dynamodb", region_name=C.AWS_REGION, config=BOTO_CONFIG)
-        return self._dynamo
-
-    def rds(self):
-        if self._rds_error:
-            raise self._rds_error
-        if self._rds is None:
+def save_or_compare(path, expected, *, create):
+    if create and not path.exists():
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+            temporary = Path(temp.name)
             try:
-                self._rds = self._rds_connect()
-            except RdsUnavailable as e:
-                self._rds_error = e
-                raise
-        return self._rds
-
-    def data(self, service, tenant):
-        return G.generate(service, tenant, self.args.n)
-
-    def expected(self, service, tenant):
-        key = (service, tenant)
-        if key not in self._expected:
-            data = self.data(service, tenant)
-            self._expected[key] = G.count_by_entity(service, data)
-            if service in USER_CHECKS:
-                et = USER_CHECKS[service]
-                ids = [u["employeeId"] for u in G.users_of(tenant)]
-                per = {e: 0 for e in ids}
-                for it in data:
-                    if it["entityType"] == et and it["employeeId"] in per:
-                        per[it["employeeId"]] += 1
-                self._user_expected[key] = per
-        return self._expected[key]
-
-    def user_expected(self, service, tenant):
-        self.expected(service, tenant)
-        return self._user_expected.get((service, tenant), {})
-
-
-# ───────────── acciones por servicio ─────────────
-
-
-def dry_run(ctx, service, tenant, show_examples):
-    data = ctx.data(service, tenant)
-    counts = G.count_by_entity(service, data)
-    if show_examples:
-        examples = {k: v[0] for k, v in data.items() if v} if isinstance(data, dict) else {}
-        if not examples:
-            for it in data:
-                examples.setdefault(it["entityType"], it)
-        for kind, ex in examples.items():
-            print(f"    ejemplo {service}/{kind}: {json.dumps(ex, default=str, ensure_ascii=False)[:400]}")
-    return counts
-
-
-def seed_dynamo(ctx, service, tenant):
-    items = ctx.data(service, tenant)
-    writer = DynamoWriter(ctx.dynamo, C.DYNAMO_TABLES[service], ctx.args.workers, C.DYNAMO_MAX_RETRIES, ctx.args.conditional)
-    pb = bar(len(items), f"{service}/{tenant}")
-    try:
-        return writer.write(items, pb)
-    finally:
-        if pb:
-            pb.close()
-
-
-def seed_rds(ctx, service, tenant):
-    conn = ctx.rds()
-    schema = C.schema_for(tenant)
-    specs = RDS_SPECS[service]
-    try:
-        if ctx.args.create_schema:
-            create_schema(conn, schema, C.CORE_HR, C.PAYROLL)
-        missing = missing_tables(conn, schema, [s["table"] for s in specs.values()])
-        if missing:
-            raise RdsUnavailable(
-                f"faltan tablas en el schema '{schema}': {', '.join(missing)}. "
-                "Aplica las migraciones del dueño del servicio o usa --create-schema"
-            )
-        rows = ctx.data(service, tenant)
-        stats = {"written": 0, "skipped": 0}
-        for logical, spec in specs.items():
-            pb = bar(len(rows[logical]), f"{service}/{tenant}/{spec['table']}")
-            try:
-                ins = insert_rows(conn, schema, spec, rows[logical], C.RDS_PAGE_SIZE, pb)
+                temp.write(encoded(expected) + b"\n")
+                temp.flush()
+                os.fsync(temp.fileno())
+                try:
+                    os.link(temporary, path)
+                except FileExistsError:
+                    pass
+                directory = os.open(path.parent, os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
             finally:
-                if pb:
-                    pb.close()
-            stats["written"] += ins
-            stats["skipped"] += len(rows[logical]) - ins
-        return stats
-    except Exception:
-        conn.rollback()
-        raise
+                temporary.unlink()
+    if json.loads(path.read_text()) != expected:
+        raise ValueError(f"{path}: el manifiesto difiere de los datos, configuración o destinos actuales")
 
 
-def verify(ctx, service, tenant):
-    """[(entidad, esperado, encontrado)]"""
-    exp = ctx.expected(service, tenant)
-    out = []
-    if service in C.RDS_SERVICES:
-        conn = ctx.rds()
-        for logical, spec in RDS_SPECS[service].items():
-            out.append((spec["table"], exp.get(logical, 0), count_rows(conn, C.schema_for(tenant), spec["table"])))
-    else:
-        for et, expected in exp.items():
-            out.append((et, expected, count_entity(ctx.dynamo, C.DYNAMO_TABLES[service], tenant, et, G.SK_PREFIX[et])))
-    return out
+def dynamo_pass(client, tables, data, *, verify=False, insert=False):
+    for service, table in tables.items():
+        for tenant, (_, services) in data.items():
+            groups = services[service]
+            dynamo_writer.check_associations(client, table, tenant, service, groups)
+            dynamo_writer.reconcile(client, table, groups, verify=verify, insert=insert)
 
 
-def verify_users(ctx, service, tenant):
-    """[(employeeId, esperado, encontrado)] para cada usuario demo del tenant (attendance y performance)."""
-    if service not in USER_CHECKS:
-        return []
-    et = USER_CHECKS[service]
-    table = C.DYNAMO_TABLES[service]
-    return [
-        (emp, exp, count_entity(ctx.dynamo, table, tenant, et, f"{G.SK_PREFIX[et]}{emp}#"))
-        for emp, exp in ctx.user_expected(service, tenant).items()
-    ]
+def run_online(mode, path):
+    import psycopg2
+
+    region, tables, db = C.destinations()
+    writing = mode != "verify"
+    dynamo, resources = inspect_aws(region, tables, load=writing, check_iam=mode != "diagnose")
+    with closing(psycopg2.connect(**db)) as conn:
+        conn.set_session(isolation_level="REPEATABLE READ", readonly=True)
+        with conn:
+            departments = rds_writer.inspect(conn, writing=writing, prepare_load=writing)
+            with conn.cursor() as cur:
+                cur.execute("SELECT oid::text FROM pg_database WHERE datname = current_database()")
+                database_oid, = cur.fetchone()
+            data = generators.dataset(generators.FULL_SIZE, departments)
+            expected = manifest(data, departments, {**db, "oid": database_oid}, resources)
+            if mode in ("load", "verify"):
+                save_or_compare(path, expected, create=False)
+            rds_writer.reconcile(conn, data, verify=not writing)
+        dynamo_pass(dynamo, tables, data, verify=not writing)
+        if mode == "preflight":
+            save_or_compare(path, expected, create=True)
+        if mode == "load":
+            conn.set_session(isolation_level="READ COMMITTED", readonly=False)
+            with conn:
+                locked_departments = rds_writer.inspect(conn, writing=True, lock=True)
+                if locked_departments != departments:
+                    raise ValueError("Los UUID de los departamentos cambiaron durante el preflight")
+                rds_writer.reconcile(conn, data, insert=True)
+                rds_writer.reconcile(conn, data, verify=True)
+            print("PostgreSQL confirmado. Iniciando las transacciones DynamoDB.", flush=True)
+            dynamo_pass(dynamo, tables, data, insert=True)
+            dynamo_pass(dynamo, tables, data, verify=True)
+        return expected["counts"], expected["complementary"]
 
 
-def friendly_error(service, e):
-    from botocore.exceptions import ClientError, NoCredentialsError, EndpointConnectionError
-
-    if isinstance(e, RdsUnavailable):
-        return f"RDS no disponible: {e}"
-    if isinstance(e, NoCredentialsError):
-        return "faltan credenciales AWS (exporta AWS_ACCESS_KEY_ID/SECRET/SESSION_TOKEN del Learner Lab)"
-    if isinstance(e, EndpointConnectionError):
-        return f"no hay conexión con DynamoDB en {C.AWS_REGION}"
-    if isinstance(e, ClientError):
-        code = e.response["Error"]["Code"]
-        if code == "ResourceNotFoundException":
-            return f"la tabla {C.DYNAMO_TABLES.get(service)} no existe en {C.AWS_REGION} (¿desplegaste el servicio con STAGE={C.STAGE}?)"
-        if code in ("ExpiredTokenException", "UnrecognizedClientException"):
-            return "credenciales AWS expiradas o inválidas (renueva la sesión del Learner Lab)"
-        return f"{code}: {e.response['Error'].get('Message', '')}"
-    if isinstance(e, DynamoSeedError):
-        return str(e)
-    return f"{type(e).__name__}: {e}"
-
-
-def main(argv=None, dynamo_client=None, rds_connect=None):
-    args = parse_args(argv)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", choices=("dry-run", "diagnose", "preflight", "load", "verify"))
+    parser.add_argument("--sample", action="store_true", help="Solo para dry-run")
+    parser.add_argument("--manifest", type=Path, default=Path("seed-30k-manifest.json"))
+    aliases = parser.add_mutually_exclusive_group()
+    aliases.add_argument("--dry-run", dest="alias", action="store_const", const="dry-run")
+    aliases.add_argument("--verify", dest="alias", action="store_const", const="verify")
+    args = parser.parse_args(argv)
+    if bool(args.mode) == bool(args.alias):
+        parser.error("indica un único modo, como comando o como opción compatible")
+    args.mode = args.mode or args.alias
+    if args.sample and args.mode != "dry-run":
+        parser.error("--sample solo está permitido para dry-run")
     try:
-        users = load_users(args)
-    except C.UsersFileError as e:
-        print(f"ERROR usuarios: {e}\nNo se escribió nada.", file=sys.stderr)
-        return 3
-    ctx = Context(args, dynamo_client, rds_connect)
-    mode = "dry-run" if args.dry_run else "verify" if args.verify else "seed"
-    print(f"HCM seed · modo={mode} · stage={C.STAGE} · tenants={','.join(args.tenants)} · por tenant={args.n:,} · servicios={','.join(args.services)}")
-
-    print("Usuarios demo: " + "; ".join(f"{t}=" + ",".join(u["employeeId"] for u in us) for t, us in users.items()))
-
-    rows, user_rows, failures = [], [], {}
-    started = time.time()
-
-    for service in args.services:
-        for tenant in args.tenants:
-            try:
-                if mode == "dry-run":
-                    for et, n in dry_run(ctx, service, tenant, tenant == args.tenants[0]).items():
-                        rows.append((service, tenant, et, f"{n:,}", "", ""))
-                elif mode == "verify":
-                    for et, exp, found in verify(ctx, service, tenant):
-                        status = "OK" if found == exp else ("FALTAN" if found < exp else "EXTRA")
-                        rows.append((service, tenant, et, f"{exp:,}", f"{found:,}", status))
-                    for emp, exp, found in verify_users(ctx, service, tenant):
-                        status = "OK" if found >= exp > 0 else "FALTAN"
-                        user_rows.append((service, tenant, emp, USER_CHECKS[service], f"{exp:,}", f"{found:,}", status))
-                else:
-                    t0 = time.time()
-                    fn = seed_rds if service in C.RDS_SERVICES else seed_dynamo
-                    st = fn(ctx, service, tenant)
-                    rows.append((service, tenant, "*", f"{st['written']:,}", f"{st['skipped']:,}", f"{time.time() - t0:.1f}s"))
-            except Exception as e:  # un servicio caído no detiene a los demás
-                msg = friendly_error(service, e)
-                failures.setdefault(service, msg)
-                print(f"  [{service}/{tenant}] ERROR: {msg}", file=sys.stderr)
-                if isinstance(e, RdsUnavailable) and ctx._rds_error:
-                    break  # sin conexión: no insistir con el resto de tenants
-
-    print()
-    headers = {
-        "dry-run": ["servicio", "tenant", "entidad", "generados", "", ""],
-        "verify": ["servicio", "tenant", "entidad", "esperado", "encontrado", "estado"],
-        "seed": ["servicio", "tenant", "entidad", "escritos", "ya existían", "tiempo"],
-    }[mode]
-    if rows:
-        print_table(headers, rows)
-    if user_rows:
-        print("\nUsuarios demo (su employeeId debe existir en attendance y performance):")
-        print_table(["servicio", "tenant", "employeeId", "entidad", "esperado", "encontrado", "estado"], user_rows)
-    if mode != "seed":
-        print(f"\nPrincipales (deben ser {args.n:,} por tenant): " + "; ".join(f"{s}={'+'.join(G.MAIN_ENTITIES[s])}" for s in args.services))
-
-    print(f"\nTiempo total: {time.time() - started:.1f}s")
-    if failures:
-        print("\nServicios con error:", file=sys.stderr)
-        for s, m in failures.items():
-            print(f"  - {s}: {m}", file=sys.stderr)
+        print("Sin vínculo con Auth. IDs incompatibles excluidos:", ", ".join(C.EXCLUDED_AUTH_IDS), flush=True)
+        if args.mode == "dry-run":
+            size = generators.SAMPLE_SIZE if args.sample else generators.FULL_SIZE
+            data = generators.dataset(size, generators.dry_departments())
+            counts = validate(data, sample=args.sample)
+            complementary = complementary_counts(data)
+            print(f"SHA-256 de la simulación: {digest(data)}")
+        else:
+            if args.mode == "diagnose":
+                print("Diagnóstico de solo lectura. Omite la simulación IAM y no habilita la carga.", flush=True)
+            counts, complementary = run_online(args.mode, args.manifest)
+        totals = {name: sum(tenant[name] for tenant in counts.values()) for name in next(iter(counts.values()))}
+        print(json.dumps({"por_tenant": counts, "total_por_entidad": totals, "complementarios_por_tenant": complementary,
+                          "TOTAL_GLOBAL": sum(totals.values())}, indent=2))
+        return 0
+    except Exception as exc:
+        print(f"{args.mode} detenido: {exc}", file=sys.stderr)
         return 1
-    if mode == "verify" and (any(r[5] == "FALTAN" for r in rows) or any(r[6] == "FALTAN" for r in user_rows)):
-        return 2
-    return 0
 
 
 if __name__ == "__main__":

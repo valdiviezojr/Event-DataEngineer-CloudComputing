@@ -1,81 +1,93 @@
-"""Integración con un PostgreSQL local temporal (se omite si no hay initdb/pg_ctl en el PATH)."""
-import shutil
+import os
+from pathlib import Path
 import subprocess
+import sys
+import unittest
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import seed_config as C
-import seed_master
+import generators as gen
+import rds_writer
 
-
-def norm(text):
-    """Colapsa espacios para comparar filas de la tabla impresa sin depender del ancho de columna."""
-    return "\n".join(" ".join(line.split()) for line in text.splitlines())
-
-
-
-PORT = 54329
-pytestmark = pytest.mark.skipif(not (shutil.which("initdb") and shutil.which("pg_ctl")), reason="PostgreSQL local no disponible")
+SOCKET = os.getenv("SEED_TEST_LOCAL_SOCKET", "")
+VERIFY = Path(__file__).resolve().parents[3] / "Proyecto2_Cloud_Integrante2/db/verify_30k_seeding.sql"
 
 
-@pytest.fixture(scope="module")
-def pg(tmp_path_factory):
-    data = tmp_path_factory.mktemp("pgdata")
-    sock = tmp_path_factory.mktemp("pgsock")
-    subprocess.run(["initdb", "-D", str(data), "-U", "postgres", "--auth=trust", "-E", "UTF8"], check=True, capture_output=True)
-    subprocess.run(
-        ["pg_ctl", "-D", str(data), "-l", str(data / "log"), "-w", "start", "-o", f"-p {PORT} -k {sock} -c listen_addresses=127.0.0.1"],
-        check=True, capture_output=True,
-    )
-    subprocess.run(["createdb", "-h", "127.0.0.1", "-p", str(PORT), "-U", "postgres", "hcm_db"], check=True, capture_output=True)
-    yield
-    subprocess.run(["pg_ctl", "-D", str(data), "-m", "immediate", "stop"], capture_output=True)
+@unittest.skipUnless(SOCKET.startswith("/tmp/"), "requiere PostgreSQL local desechable en socket Unix bajo /tmp")
+class LocalPostgresTest(unittest.TestCase):
+    def setUp(self):
+        import psycopg2
 
+        self.conn = psycopg2.connect(host=SOCKET)
+        self.addCleanup(self.conn.close)
 
-@pytest.fixture
-def rds_env(pg, monkeypatch):
-    monkeypatch.setitem(C.RDS, "host", "127.0.0.1")
-    monkeypatch.setitem(C.RDS, "port", PORT)
-    monkeypatch.setitem(C.RDS, "sslmode", "disable")
+    def test_trigger_refused(self):
+        with self.conn.cursor() as cur:
+            cur.execute("CREATE FUNCTION tenant_a.test_seed_trigger() RETURNS trigger "
+                        "LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$")
+            cur.execute("CREATE TRIGGER test_seed_trigger BEFORE INSERT ON tenant_a.employees "
+                        "FOR EACH ROW EXECUTE FUNCTION tenant_a.test_seed_trigger()")
+        with self.assertRaisesRegex(ValueError, "test_seed_trigger"):
+            rds_writer.inspect(self.conn)
+        self.conn.rollback()
 
+    def test_conflicting_period_leaves_data_unchanged(self):
+        departments = rds_writer.inspect(self.conn)
+        with self.conn.cursor() as cur:
+            cur.execute("INSERT INTO tenant_b.payroll_periods(period_name) VALUES ('2025-12')")
+        data = gen.dataset(gen.SAMPLE_SIZE, departments)
+        with self.assertRaisesRegex(ValueError, "tenant_b.payroll_periods"):
+            rds_writer.reconcile(self.conn, data, insert=True)
+        self.conn.rollback()
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM tenant_a.employees WHERE email LIKE '%@seed.example.invalid'")
+            self.assertEqual(cur.fetchone()[0], 0)
 
-def test_sin_tablas_mensaje_claro(rds_env, capsys, tmp_path):
-    users = tmp_path / "users.json"
-    users.write_text('[{"tenantId": "tenant_z", "employeeId": "emp-z-1"}]')
-    rc = seed_master.main(["--sample", "--service", "core_hr", "--tenants", "tenant_z", "--users-file", str(users)])
-    assert rc == 1
-    assert "faltan tablas en el schema 'tenant_z'" in capsys.readouterr().err
+    def test_full_local_load_resume_and_sql_verification(self):
+        def verify_sql():
+            return subprocess.run(["psql", "-X", "-h", SOCKET, "-f", str(VERIFY)], text=True, capture_output=True)
 
-
-def test_seed_rds_idempotente_y_verify(rds_env, capsys):
-    args = ["--sample", "--service", "core_hr", "payroll"]
-    assert seed_master.main(args + ["--create-schema"]) == 0
-    first = norm(capsys.readouterr().out)
-    assert "core_hr tenant_a * 220 0" in first  # 20 departamentos + 100 empleados + 100 contratos
-
-    assert seed_master.main(args) == 0  # segunda corrida: ON CONFLICT DO NOTHING
-    second = norm(capsys.readouterr().out)
-    assert "core_hr tenant_a * 0 220" in second
-    assert "payroll tenant_c * 0 101" in second
-
-    assert seed_master.main(args + ["--verify"]) == 0
-    out = norm(capsys.readouterr().out)
-    assert "core_hr tenant_b employees 100 100 OK" in out
-    assert "payroll tenant_a pay_slips 100 100 OK" in out
-    assert "FALTAN" not in out
-
-
-def test_usuarios_demo_en_rds(rds_env):
-    """employee_id de los usuarios (no UUID) entra en employees, contracts y pay_slips (DDL VARCHAR(64))."""
-    import psycopg2
-
-    assert seed_master.main(["--sample", "--service", "core_hr", "payroll", "--create-schema"]) == 0
-    conn = psycopg2.connect(host="127.0.0.1", port=PORT, user="postgres", dbname="hcm_db", sslmode="disable")
-    with conn.cursor() as cur:
-        for t, users in C.load_users().items():
-            for u in users:
-                cur.execute(f"SELECT email, status FROM {t}.employees WHERE employee_id = %s", (u["employeeId"],))
-                assert cur.fetchone() == (u["email"], "ACTIVE")
-                cur.execute(f"SELECT count(*) FROM {t}.pay_slips WHERE employee_id = %s", (u["employeeId"],))
-                assert cur.fetchone()[0] > 0
-    conn.close()
+        before = verify_sql()
+        self.assertEqual(before.returncode, 3, before.stderr)
+        self.assertIn("departamentos válidos=4", before.stderr)
+        with self.conn:
+            departments = rds_writer.inspect(self.conn, writing=True, lock=True)
+            data = gen.dataset(gen.FULL_SIZE, departments)
+            with self.conn.cursor() as cur:
+                cur.execute("INSERT INTO tenant_a.employees(first_name, last_name, email) "
+                            "VALUES ('Previo', 'Ajeno', 'previo@empresa.example')")
+            rds_writer.reconcile(self.conn, data, insert=True)
+            rds_writer.reconcile(self.conn, data, verify=True)
+        try:
+            with self.conn:
+                rds_writer.reconcile(self.conn, data, insert=True)
+                rds_writer.reconcile(self.conn, data, verify=True)
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT count(*) FROM tenant_a.employees")
+                    self.assertEqual(cur.fetchone()[0], 10001)
+                    cur.execute("SELECT count(*) FROM tenant_a.departments")
+                    self.assertEqual(cur.fetchone()[0], 20)
+                    cur.execute("SELECT count(DISTINCT employee_id), count(DISTINCT period_id) FROM tenant_a.pay_slips")
+                    self.assertEqual(cur.fetchone(), (1000, 10))
+                    cur.execute("SELECT count(*) FROM tenant_a.payroll_periods WHERE period_name = '2026-11'")
+                    self.assertEqual(cur.fetchone()[0], 1)
+            after = verify_sql()
+            self.assertEqual(after.returncode, 0, after.stderr)
+            self.assertIn("TOTAL_GLOBAL=60000", after.stderr)
+            with self.conn, self.conn.cursor() as cur:
+                cur.execute("DELETE FROM tenant_b.pay_slips WHERE pay_slip_id = %s",
+                            (data["tenant_b"][0]["pay_slips"][0]["pay_slip_id"],))
+            incomplete = verify_sql()
+            self.assertEqual(incomplete.returncode, 3, incomplete.stderr)
+            self.assertIn("2025-03: boletas=999", incomplete.stderr)
+            with self.conn, self.assertRaisesRegex(ValueError, "faltan 1"):
+                rds_writer.reconcile(self.conn, data, verify=True)
+        finally:
+            with self.conn, self.conn.cursor() as cur:
+                for tenant in gen.C.TENANTS:
+                    cur.execute(f"DELETE FROM {tenant}.pay_slips WHERE period_id IN "
+                                f"(SELECT period_id FROM {tenant}.payroll_periods WHERE period_name BETWEEN '2025-03' AND '2025-12')")
+                    cur.execute(f"DELETE FROM {tenant}.payroll_periods WHERE period_name BETWEEN '2025-03' AND '2025-12'")
+                    cur.execute(f"DELETE FROM {tenant}.employee_salary_profiles WHERE email LIKE '%@seed.example.invalid'")
+                    cur.execute(f"DELETE FROM {tenant}.employees WHERE email LIKE '%@seed.example.invalid' OR email = 'previo@empresa.example'")
+                    cur.execute(f"DELETE FROM {tenant}.departments WHERE name LIKE 'HCM Seed 30k %'")

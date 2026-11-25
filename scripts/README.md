@@ -1,155 +1,56 @@
-# Seeding HCM (`seed_master.py`)
+# Carga de datos ficticios de HCM
 
-Genera **10,000 registros por tenant** en cada microservicio (**30,000** con `tenant_a`, `tenant_b` y `tenant_c`) y los carga en RDS PostgreSQL (core_hr, payroll) y DynamoDB (recruitment, performance, attendance).
+Por tenant se generan 10 000 empleados, 10 000 boletas, 10 000 candidatos, 2 000 metas, 8 000 evaluaciones y 10 000 marcaciones. Python informa `TOTAL_GLOBAL=150000` para los cinco servicios. El SQL informa `TOTAL_GLOBAL=60000` para empleados y boletas de PostgreSQL. Los departamentos, períodos, contratos, perfiles, vacantes, guards y summaries quedan fuera de ambos totales.
 
-Los tenants y los `employeeId` de los **usuarios demo de hcm-auth** salen de [`users.json`](users.json), así que al iniciar sesión cada usuario ve sus propios datos.
+El calendario usa diez meses cerrados de marzo a diciembre de 2025, los ciclos 2025-Q3 y 2025-Q4 y la fecha de referencia 2026-01-01. Los mismos 1 000 empleados por tenant reciben una boleta mensual. Los contratos comienzan en enero de 2024. Las boletas descuentan una retención del 13 %; el total de cada período suma sus importes netos. Una colisión con un período existente detiene el preflight.
 
-```
-seed_master.py     CLI (orquesta, verifica, imprime tablas)
-seed_config.py     Configuración (todo sobrescribible por variables de entorno) + carga/validación de users.json
-users.json         Usuarios demo de hcm-auth: tenantId, employeeId, email, role
-generators.py      Generadores puros de ítems/filas (sin AWS ni RDS)
-dynamo_writer.py   Escritura DynamoDB: batch + backoff, o PutItem condicional
-rds_writer.py      Escritura RDS: execute_values (lotes de 2,000) + ON CONFLICT DO NOTHING
-tests/             pytest: generadores, moto (DynamoDB) y PostgreSQL local opcional
-```
+Cada tenant reutiliza los UUID de sus cuatro departamentos oficiales y añade 16 departamentos ficticios determinísticos. Recruitment crea 50 vacantes cerradas, con 200 candidaturas en borrador y 200 guards por vacante. Cada lote de hasta 49 pares incluye la vacante por inserción condicional o por `ConditionCheck` sobre sus atributos. Las postulaciones enviadas son cero. Las metas tienen recordatorios desactivados. Attendance genera 200 licencias `PENDING` de tipo `VACATION` o `SICK`, cada una para un empleado distinto fuera de la cohorte de Payroll y con fechas sin marcaciones. Estas licencias no requieren filas en el ledger. Los empleados son independientes de Auth. Se excluyen explícitamente `emp-001`, `emp-a-hr`, `emp-b-hr` y `52`. El archivo histórico `users.json` queda fuera del flujo.
 
-## Instalación y credenciales
+## Uso local
 
-```bash
-cd scripts
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt            # + requirements-dev.txt para los tests
+Desde la raíz del workspace con Python 3.11 o superior:
 
-# Credenciales del Learner Lab (AWS Details → AWS CLI) y DB_* del RDS, en ../.env
-set -a && source ../.env && set +a
-aws sts get-caller-identity
+```sh
+python3 Event-DataEngineer-CloudComputing/scripts/seed_master.py --dry-run --sample
+python3 Event-DataEngineer-CloudComputing/scripts/seed_master.py dry-run
+python3 -m unittest discover -s Event-DataEngineer-CloudComputing/scripts/tests -v
 ```
 
-Las tablas DynamoDB deben estar desplegadas en el mismo `STAGE` (`ms-recruitment-table-dev`, …). Si falta una, el script lo dice y sigue con el resto.
+Los dry-runs no abren conexiones. Los UUID de departamento de simulación son marcadores locales. Para las pruebas de PostgreSQL, aplica las cuatro migraciones oficiales a una instancia desechable y define `SEED_TEST_LOCAL_SOCKET` con el directorio de su socket Unix. La prueba obliga a usar un socket bajo `/tmp`; puedes definir `PGPORT`, `PGUSER` y `PGDATABASE` para ese servidor.
 
-## Uso
+## Desde EC2
 
-```bash
-python seed_master.py --dry-run                         # genera y cuenta; no conecta a nada
-python seed_master.py --dry-run --sample                # idem, 100 por tenant + un ejemplo por entidad
-python seed_master.py --service recruitment --sample    # prueba real pequeña
-python seed_master.py                                   # todo: 5 servicios × 3 tenants × 10,000
-python seed_master.py --service attendance --tenants tenant_a --per-tenant 500
-python seed_master.py --users-file otra/users.json --dry-run      # otra lista de usuarios
-python seed_master.py --verify                          # solo cuenta lo que hay (sin escribir)
-python seed_master.py --service core_hr payroll --create-schema   # RDS sin migraciones aún (DDL del diseño)
+Usa Python 3.10 o superior, el certificado CA para RDS, el perfil IAM mediante IMDS o credenciales temporales de AWS Academy y un archivo `.pgpass` con permisos 0600. El preflight exige TLS `verify-full`. Define los valores recopilados de tu entorno y ejecuta desde la raíz del workspace:
+
+```sh
+python3 -m venv .venv-seed
+. .venv-seed/bin/activate
+python3 -m pip install -r Event-DataEngineer-CloudComputing/scripts/requirements.txt
+
+export AWS_REGION=us-east-1 STAGE=dev
+export SEED_AWS_ACCOUNT_ID='<cuenta-AWS-de-12-dígitos>'
+export DB_HOST='<endpoint-RDS>' DB_PORT=5432 DB_NAME=hcm_db DB_USER='<rol-PostgreSQL>'
+export DB_SSLROOTCERT='<ruta-absoluta-al-bundle-CA-RDS>'
+export PGSSLMODE=verify-full PGSSLROOTCERT="$DB_SSLROOTCERT"
+export SEED_MANIFEST="$PWD/seed-30k-manifest.json"
+
+python3 Event-DataEngineer-CloudComputing/scripts/seed_master.py preflight --manifest "$SEED_MANIFEST"
+# A partir de aquí, solo después de autorizar la carga.
+python3 Event-DataEngineer-CloudComputing/scripts/seed_master.py load --manifest "$SEED_MANIFEST"
+python3 Event-DataEngineer-CloudComputing/scripts/seed_master.py --verify --manifest "$SEED_MANIFEST"
+psql -X -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+  -f Proyecto2_Cloud_Integrante2/db/verify_30k_seeding.sql
 ```
 
-| Opción | Efecto |
-|---|---|
-| `--service {all,core_hr,payroll,recruitment,performance,attendance}…` | uno o varios (default `all`) |
-| `--tenants t1 t2…` | default `SEED_TENANTS` o los tenants de `users.json`. Cada uno debe tener usuarios |
-| `--users-file RUTA` | archivo de usuarios (default `SEED_USERS_FILE` o `scripts/users.json`) |
-| `--per-tenant N` | registros principales por tenant (default 10,000) |
-| `--sample` | 100 por tenant |
-| `--dry-run` | no escribe ni conecta |
-| `--verify` | cuenta por tenant/servicio/entidad y compara con lo esperado (estado `OK` / `FALTAN` / `EXTRA`) |
-| `--conditional` | DynamoDB con `PutItem` + `attribute_not_exists(PK)` en vez de lotes |
-| `--create-schema` | RDS: `CREATE SCHEMA/TABLE IF NOT EXISTS` con el DDL del documento de diseño |
-| `--workers N` | hilos para DynamoDB (default 8) |
+`RECRUITMENT_TABLE`, `PERFORMANCE_TABLE` y `ATTENDANCE_TABLE` permiten declarar nombres desplegados distintos de los derivados de `STAGE`. Usa los mismos destinos y guarda el manifiesto en almacenamiento persistente para poder reanudar. El manifiesto incluye los parámetros fijos, los UUID de departamentos, el identificador de cada tabla DynamoDB y las huellas SHA-256 de los registros esperados.
 
-Códigos de salida: `0` OK · `1` algún servicio falló (los demás sí se ejecutaron) · `2` `--verify` encontró menos de lo esperado (también si un usuario demo no tiene datos) · `3` archivo de usuarios inválido (no se escribió nada).
+El preflight requiere leer las tablas, inspeccionar esquemas y catálogos, acreditar los privilegios de inserción y bloqueo en PostgreSQL, y leer las claves esperadas en DynamoDB. Comprueba `DescribeTable`, `DescribeKinesisStreamingDestination`, `GetResourcePolicy`, `BatchGetItem` y `Query` en las tres tablas. En el modo estricto, para la autorización de escritura exige `GetCallerIdentity`, `DescribeOrganization`, `DescribeVpcEndpoints`, `GetRole` y `SimulatePrincipalPolicy` y comprueba `PutItem` para las transacciones y `ConditionCheckItem` para Recruitment. Una cuenta en Organizations, un endpoint VPC de DynamoDB, una política de recurso, un Stream activo, un flujo activo hacia Kinesis o una respuesta de permisos indeterminada bloquean la carga. El seeder no puede certificar esas configuraciones con este preflight de solo lectura. El contrato de PostgreSQL exige la estructura de las migraciones 001, 003 y 004, sin triggers de usuario, reglas, RLS ni publicaciones para las tablas inspeccionadas. La firma se obtuvo de PostgreSQL 18 y cualquier diferencia de definición detiene la carga.
 
-## Usuarios demo (`users.json`)
+`load` repite el preflight antes de confirmar PostgreSQL en una transacción para los tres tenants. Solo tras confirmar y validar PostgreSQL escribe las transacciones de DynamoDB en serie. Una interrupción puede dejar SQL confirmado y parte de DynamoDB pendiente. Reejecuta `load` con el mismo manifiesto. Los grupos completos e idénticos se reutilizan. Una coincidencia incompatible o un grupo incompleto requieren investigación y causan salida distinta de cero. Mantén estable la configuración del destino durante la operación. PostgreSQL y DynamoDB tienen transacciones separadas y las comprobaciones de AWS son puntuales.
 
-```json
-[{"email": "admin@empresa-a.com", "tenantId": "tenant_a", "role": "ADMIN", "employeeId": "emp-a-admin"}, …]
-```
 
-También se acepta `{"tenants": [...], "users": [...]}` para declarar tenants explícitamente. Es la misma lista que crea `scripts/create-demo-users.js` en el repo de hcm-auth: si allí cambia un `employeeId` (hoy son **provisionales**), hay que cambiarlo aquí y volver a sembrar.
+## Diagnóstico con permisos de AWS Academy
 
-- En cada tenant, los primeros k empleados son sus k usuarios, con su `employeeId` y `email` **exactos** y `status = ACTIVE`. El resto, hasta completar N, se genera como siempre (uuid5 determinístico). Los conteos no cambian.
-- Cada usuario recibe: contrato y boletas (core_hr/payroll), 100 marcaciones `CLOSED` y al menos una licencia (attendance), 2 metas sin recordatorio y 8 evaluaciones con `SUMMARY` en **2026-Q3 y 2026-Q4** (performance).
-- Antes de escribir nada se valida que el archivo exista y sea JSON; que `tenantId` y `employeeId` cumplan `^[A-Za-z0-9_-]{1,64}$` (el regex de los handlers); que no haya `employeeId` ni email repetidos en un tenant; que cada tenant pedido tenga usuarios, y que N alcance para todos (performance necesita `N ≥ usuarios × 10`). Si algo falla, el script sale con código `3` y el detalle.
-- `--verify` añade una tabla **Usuarios demo**: cada `employeeId` debe tener sus `ATTENDANCE` en attendance y sus 2 `EVAL_SUMMARY` en performance.
+`python3 Event-DataEngineer-CloudComputing/scripts/seed_master.py diagnose` comprueba el catálogo, los destinos, las claves y los controles de replicación que el rol pueda inspeccionar. Omite la acreditación IAM y no genera manifiesto ni habilita escrituras. Si una lectura requerida, como `GetResourcePolicy`, está restringida, el diagnóstico también se detiene.
 
-**RDS no disponible.** Si `DB_HOST` está vacío, el host no responde, falta `psycopg2` o faltan las tablas, `core_hr` y `payroll` terminan con un mensaje claro (por ejemplo `RDS no disponible: No se pudo conectar a host:5432/hcm_db como postgres: …`). Los servicios DynamoDB se siembran igual.
-
-## Idempotente y reanudable
-
-- **Claves determinísticas**: `uuid5(SEED_NAMESPACE, "<tenant>:<tipo>:<índice>")`. Los valores salen de un `random.Random` sembrado con el mismo par, así que cada corrida genera exactamente los mismos datos.
-- **RDS**: `INSERT … ON CONFLICT DO NOTHING`, con commit cada 2,000 filas.
-- **DynamoDB** (modo por defecto): por cada lote de 25, `BatchGetItem` salta las claves que ya existen y `BatchWriteItem` escribe el resto. **Nunca sobrescribe** (un candidato que la API movió de etapa se queda como está).
-  - Se usa el cliente de bajo nivel y no `Table.batch_writer()` porque `batch_writer` reenvía los `UnprocessedItems` sin esperar. Aquí hay backoff exponencial con jitter (hasta `SEED_DYNAMO_MAX_RETRIES`).
-  - El throttling lo reintenta botocore en modo `adaptive`.
-- `--conditional` hace `PutItem` condicional ítem por ítem. Es más lento, pero seguro aunque haya otros escritores a la vez.
-- Si se corta a la mitad, basta con volver a ejecutar el mismo comando.
-
-## Qué se genera
-
-Los ítems DynamoDB replican campo por campo lo que escriben los handlers de `reference/` y de `services/attendance`. `employeeId` es el mismo en core_hr, payroll, performance y attendance (el del usuario demo, o un uuid5 para el resto), así que los datos cruzan entre servicios.
-
-| Servicio | Principal (= N por tenant) | Además | Detalle |
-|---|---|---|---|
-| core_hr (RDS) | `employees` | `departments` (20), `contracts` (1 por empleado) | email único `nombre.apellido.<i>@tenant-x.example.com` |
-| payroll (RDS) | `pay_slips` | `payroll_periods` (10 meses cerrados) | 1,000 empleados × 10 periodos; `base_salary` = salario del contrato; descuento 13% (TODO) |
-| recruitment | `CANDIDATE` | `VACANCY` (50), `UNIQUE_GUARD` (1 por candidato) | etapas APPLIED 40% · INTERVIEW 25% · OFFER 10% · HIRED 5% · REJECTED 20% |
-| performance | `GOAL` + `EVALUATION` | `EVAL_SUMMARY` | 1,000 empleados × (2 metas + 2 ciclos × 4 evaluadores) = 2,000 GOAL + 8,000 EVALUATION |
-| attendance | `ATTENDANCE` | `LEAVE` (2% = 200) | 100 empleados × 100 días hábiles anteriores a la fecha de referencia |
-
-Por qué así:
-
-- **Recruitment**:
-  - IDs `c-<uuid>` y `v-<uuid>` (cumplen `^c-[0-9a-f-]{36}$`).
-  - `PK/SK/GSI1PK/GSI1SK` idénticos a `createCandidate`. El guard `UNIQUE#APPLICATION#<vacancyId>#<email>` se crea igual que en su `TransactWrite`, para que la API siga devolviendo 409 ante un duplicado.
-  - `stageHistory` sigue las `TRANSITIONS` de `updateStage` (`DRAFT→APPLIED` por el candidato, el resto por `system`).
-  - `candidatesCount` = número de candidatos enviados de la vacante (el submit es lo único que lo incrementa).
-  - 1 de cada 10 vacantes queda `CLOSED`.
-- **Performance**:
-  - `getEmployeePerformance` arranca leyendo `SUMMARY#<emp>#`; sin SUMMARY no muestra evaluaciones. Por eso se siembran los `EVAL_SUMMARY` (`evaluationsCount`, `scoreSum`, `lastScore`) calculados a partir de las evaluaciones, igual que el `ADD` de `submitEvaluation`.
-  - Cada empleado tiene evaluaciones en `2026-Q3` y `2026-Q4` (fijos por defecto: el ciclo forma parte de la clave, así que no dependen del día en que se ejecute), para que la comparación entre ciclos (`compareWith`) tenga datos. Por eso la proporción es 80% EVALUATION / 20% GOAL.
-  - Relaciones SELF, MANAGER, PEER y DIRECT_REPORT. El evaluador siempre es distinto del evaluado salvo en SELF, y `anonymous` solo se usa en PEER.
-  - Puntajes en pasos de 0.5 y `score` = promedio redondeado igual que el handler.
-  - **Metas con `reminder.enabled = false` y sin `GSI1PK/GSI1SK`**. Si no, el cron horario `dispatchGoalReminders` enviaría miles de correos SES. Un test con moto comprueba que el GSI `REMINDER` queda vacío.
-- **Attendance**:
-  - Las marcaciones son todas `CLOSED` (entrada 07:45–09:00 hora Perú, de 8 a 10 h trabajadas).
-  - Las licencias son futuras y no se solapan por empleado: mitad `PENDING`, mitad `APPROVED`, con `daysUnpaid` según la regla del contrato.
-
-Limitaciones conocidas:
-
-- Los archivos S3 (CV, certificados) **no se suben**. Los ítems tienen su `s3Key`, pero `GET /documents` responderá 404 "aún no existe".
-- Las licencias `APPROVED` sembradas **no publicaron** `leave.approved`: Nóminas no las descuenta.
-- Los correos usan dominios `example.com`. Si se cambia de etapa a un candidato sembrado, SES en sandbox rechazará el envío y el worker lo descarta.
-- Las columnas y tipos de core_hr/payroll siguen el documento de diseño y están marcados `# TODO: ajustar al esquema final` en `seed_config.py` (incluidos `CONTRACT_TYPES` y el % de descuento).
-- El DDL provisional de `--create-schema` usa `employee_id VARCHAR(64)` (no `UUID`) para aceptar IDs como `emp-a-admin`. Si las migraciones finales de Core HR usan `UUID`, core_hr y payroll fallarán con los usuarios demo.
-
-## Configuración (variables de entorno)
-
-| Variable | Default |
-|---|---|
-| `STAGE`, `AWS_REGION` | `dev`, `us-east-1` |
-| `RECRUITMENT_TABLE`, `PERFORMANCE_TABLE`, `ATTENDANCE_TABLE` | `ms-<svc>-table-${STAGE}` |
-| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SSLMODE` | —, 5432, `hcm_db`, `postgres`, —, `prefer` |
-| `SCHEMA_TENANT_A` … | nombre del tenant |
-| `SEED_USERS_FILE` | `scripts/users.json` |
-| `SEED_TENANTS`, `SEED_PER_TENANT` | tenants de `users.json`, 10000 |
-| `SEED_REFERENCE_DATE` | hoy (solo afecta fechas, no claves) |
-| `SEED_NAMESPACE` | fijo; cambiarlo genera **otro** dataset |
-| `SEED_VACANCIES_PER_TENANT`, `SEED_ATTENDANCE_EMPLOYEES`, `SEED_PAYROLL_EMPLOYEES`, `SEED_LEAVES_RATIO` | 50, 100, 1000, 0.02 |
-| `SEED_PERF_CYCLES` | `2026-Q3,2026-Q4` (`,` = trimestre de la fecha de referencia y el anterior) |
-| `SEED_DYNAMO_WORKERS`, `SEED_DYNAMO_MAX_RETRIES`, `SEED_RDS_PAGE_SIZE` | 8, 8, 2000 |
-
-Los nombres de tablas y columnas RDS se cambian en `seed_config.py` (`CORE_HR`, `PAYROLL`).
-
-## Tests
-
-```bash
-pip install -r requirements-dev.txt
-python -m pytest tests -q
-```
-
-- `test_generators.py`: IDs según los regex de los handlers; claves iguales a las de los handlers; ninguna meta con GSI1; conteos exactos (10,000 por tenant); coherencia de `candidatesCount`, `stageHistory`, summaries, licencias y salarios; determinismo. Usuarios demo con su `employeeId` exacto en los 4 servicios con empleados (también con `--sample`) y validación de archivos inválidos.
-- `test_seed_master.py` (moto):
-  - `--dry-run` no escribe nada; `--sample` + `--verify` dan OK.
-  - La segunda corrida no escribe nada y no sobrescribe ítems modificados; se reanuda tras un corte.
-  - Las consultas de los handlers (GSI1 de candidatos, prefijos de performance) funcionan sobre lo sembrado y el GSI `REMINDER` queda vacío.
-  - Con RDS caído o sin configurar, DynamoDB sigue funcionando.
-  - Mensaje claro si falta una tabla; backoff ante `UnprocessedItems`; nunca se usa Scan.
-  - `--verify` marca `FALTAN` si un usuario demo pierde sus SUMMARY; archivo de usuarios inválido, tenant sin usuarios o N insuficiente → código 3 y ninguna escritura.
-- `test_rds_postgres.py`: levanta un PostgreSQL temporal con `initdb`/`pg_ctl` y lo para al final (incluye los `employee_id` de los usuarios). Se omite si no están instalados.
+En AWS Academy, configura las credenciales temporales y ejecuta export SEED_AWS_ACADEMY=1 antes del preflight. Este modo realiza pruebas transaccionales con condiciones imposibles, sin insertar registros. Se mantienen las validaciones de integridad, destinos y conflictos. Las pruebas no garantizan todos los permisos futuros ni atomicidad entre PostgreSQL y DynamoDB. El modo estricto sigue siendo el predeterminado.
